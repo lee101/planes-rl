@@ -3,7 +3,7 @@
 
 struct float8 { float a, b, c, d, e, f, g, h; };
 
-void run_ga(int pop, int gens, int nseeds, const char* out_dir);
+void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init_path);
 void* panelbuf_alloc(int pop);
 void gpu_prepare(const Genome* d_gs, void* pb, int pop);
 void gpu_sim(void* pb, int pop, int seed, float* d_fitness,

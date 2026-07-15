@@ -113,20 +113,27 @@ __global__ void k_resolve(const unsigned long long* zb, uint8_t* rgb) {
 }
 
 // ---- mesh generation for rendering (COM-centered body frame) ----
+// one block per plane; shared-memory mesh (avoids huge per-thread local reservation)
 __global__ void k_meshgen(const Genome* gs, int n, v3* verts, int* tris, int* nvs, int* nts) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x;
     if (i >= n) return;
-    v3 V[MAX_V]; int T[MAX_T][3]; MeshOut mo;
-    Genome g = gs[i];
-    build_mesh(&g, V, T, &mo);
-    MassProps mp; mass_props(&g, V, T, mo.nt, &mp);
-    for (int v = 0; v < mo.nv; v++) verts[i * MAX_V + v] = sub(V[v], mp.com);
-    for (int t = 0; t < mo.nt; t++) {
+    __shared__ v3 V[MAX_V]; __shared__ int T[MAX_T][3];
+    __shared__ MassProps s_mp; __shared__ MeshOut s_mo;
+    if (threadIdx.x == 0) {
+        MeshOut mo;
+        Genome g = gs[i];
+        build_mesh(&g, V, T, &mo);
+        MassProps mp; mass_props(&g, V, T, mo.nt, &mp);
+        s_mp = mp; s_mo = mo;
+        nvs[i] = mo.nv; nts[i] = mo.nt;
+    }
+    __syncthreads();
+    for (int v = threadIdx.x; v < s_mo.nv; v += blockDim.x) verts[i * MAX_V + v] = sub(V[v], s_mp.com);
+    for (int t = threadIdx.x; t < s_mo.nt; t += blockDim.x) {
         tris[(i * MAX_T + t) * 3] = T[t][0];
         tris[(i * MAX_T + t) * 3 + 1] = T[t][1];
         tris[(i * MAX_T + t) * 3 + 2] = T[t][2];
     }
-    nvs[i] = mo.nv; nts[i] = mo.nt;
 }
 
 __device__ __forceinline__ v3 pose_xform(float8 r, v3 p) {
@@ -280,7 +287,7 @@ static Recorded record_flights(const Genome* genomes, int n, int seed, float spr
     CK(cudaMalloc(&R.d_tris, sizeof(int) * n * MAX_T * 3));
     CK(cudaMalloc(&R.d_nts, sizeof(int) * n));
     CK(cudaMalloc(&R.d_nvs, sizeof(int) * n));
-    k_meshgen<<<(n + 63) / 64, 64>>>(d_gs, n, R.d_verts, R.d_tris, R.d_nvs, R.d_nts);
+    k_meshgen<<<n, 64>>>(d_gs, n, R.d_verts, R.d_tris, R.d_nvs, R.d_nts);
     CK(cudaDeviceSynchronize());
     R.h_rec.resize((size_t)n * R.rec_cap);
     CK(cudaMemcpy(R.h_rec.data(), R.d_rec, sizeof(float8) * n * R.rec_cap, cudaMemcpyDeviceToHost));
@@ -362,7 +369,7 @@ void render_turntable(const Genome* g, const char* out, int seconds, const char*
     v3* d_verts; int* d_tris; int* d_nts; int* d_nvs;
     CK(cudaMalloc(&d_verts, sizeof(v3) * MAX_V)); CK(cudaMalloc(&d_tris, sizeof(int) * MAX_T * 3));
     CK(cudaMalloc(&d_nts, 4)); CK(cudaMalloc(&d_nvs, 4));
-    k_meshgen<<<1, 1>>>(d_g, 1, d_verts, d_tris, d_nvs, d_nts);
+    k_meshgen<<<1, 64>>>(d_g, 1, d_verts, d_tris, d_nvs, d_nts);
     CK(cudaDeviceSynchronize());
     int frames = seconds * FPS;
     float8* d_rec; CK(cudaMalloc(&d_rec, sizeof(float8) * frames));

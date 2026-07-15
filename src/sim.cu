@@ -19,16 +19,24 @@ struct PanelBuf {
     PlaneState* st;
 };
 
+// one block per plane; mesh built in shared memory (per-thread local arrays would
+// reserve GBs of device local memory across all resident threads)
 __global__ void k_prepare(const Genome* gs, PanelBuf pb, int pop) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x;
     if (i >= pop) return;
-    v3 V[MAX_V]; int T[MAX_T][3]; MeshOut mo;
-    Genome g = gs[i];
-    build_mesh(&g, V, T, &mo);
-    MassProps mp; mass_props(&g, V, T, mo.nt, &mp);
-    pb.mp[i] = mp; pb.nt[i] = mo.nt;
-    for (int t = 0; t < mo.nt; t++) {
-        v3 a = sub(V[T[t][0]], mp.com), b = sub(V[T[t][1]], mp.com), c = sub(V[T[t][2]], mp.com);
+    __shared__ v3 V[MAX_V]; __shared__ int T[MAX_T][3];
+    __shared__ MassProps s_mp; __shared__ int s_nt;
+    if (threadIdx.x == 0) {
+        MeshOut mo;
+        Genome g = gs[i];
+        build_mesh(&g, V, T, &mo);
+        MassProps mp; mass_props(&g, V, T, mo.nt, &mp);
+        pb.mp[i] = mp; pb.nt[i] = mo.nt;
+        s_mp = mp; s_nt = mo.nt;
+    }
+    __syncthreads();
+    for (int t = threadIdx.x; t < s_nt; t += blockDim.x) {
+        v3 a = sub(V[T[t][0]], s_mp.com), b = sub(V[T[t][1]], s_mp.com), c = sub(V[T[t][2]], s_mp.com);
         v3 nrm = cross(sub(b, a), sub(c, a));
         float A = 0.5f * len(nrm);
         v3 ct = scl(add(add(a, b), c), 1.0f / 3);
@@ -168,7 +176,7 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
 
 void gpu_prepare(const Genome* d_gs, void* pbv, int pop) {
     PanelBuf* pb = (PanelBuf*)pbv;
-    k_prepare<<<(pop + 63) / 64, 64>>>(d_gs, *pb, pop);
+    k_prepare<<<pop, 64>>>(d_gs, *pb, pop);
     CK(cudaGetLastError());
 }
 
@@ -204,10 +212,32 @@ static void grand(Genome* g, std::mt19937& rng) {
     for (int i = 0; i < GENOME_N; i++) gset(g, i, G_LO[i] + u(rng) * (G_HI[i] - G_LO[i]));
 }
 
-void run_ga(int pop, int gens, int nseeds, const char* out_dir) {
+static void save_best(const char* out_dir, const Genome* g) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/best.bin", out_dir);
+    FILE* f = fopen(path, "wb"); fwrite(g, sizeof(Genome), 1, f); fclose(f);
+}
+
+static void save_genomes(const char* out_dir, const char* name, const Genome* gs, int n) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", out_dir, name);
+    FILE* f = fopen(path, "wb");
+    fwrite(&n, 4, 1, f); fwrite(gs, sizeof(Genome), n, f); fclose(f);
+}
+
+void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init_path) {
     std::mt19937 rng(42);
     std::vector<Genome> gs(pop), next(pop);
     for (auto& g : gs) grand(&g, rng);
+    if (init_path) {
+        FILE* f = fopen(init_path, "rb");
+        if (f) {
+            int n = 0; fread(&n, 4, 1, f);
+            if (n > pop) n = pop;
+            fread(gs.data(), sizeof(Genome), n, f); fclose(f);
+            printf("warm start: %d genomes from %s\n", n, init_path);
+        }
+    }
     Genome* d_gs; float* d_fit;
     CK(cudaMalloc(&d_gs, sizeof(Genome) * pop));
     CK(cudaMalloc(&d_fit, sizeof(float) * pop));
@@ -240,6 +270,13 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir) {
             printf("gen %4d best %7.2fm mean %7.2fm p90 %7.2fm\n", gen, acc[idx[0]], mean, acc[idx[pop / 10]]);
         if (acc[idx[0]] > best_ever_f) { best_ever_f = acc[idx[0]]; best_ever = gs[idx[0]]; }
         archive.push_back(gs[idx[0]]);
+        if (gen % 25 == 24) { // checkpoint: GPU crash mid-run keeps artifacts
+            save_best(out_dir, &best_ever);
+            std::vector<Genome> srt(pop);
+            for (int i = 0; i < pop; i++) srt[i] = gs[idx[i]];
+            save_genomes(out_dir, "pop.bin", srt.data(), pop);
+            save_genomes(out_dir, "archive.bin", archive.data(), (int)archive.size());
+        }
         // evolve
         int elite = pop / 64;
         float anneal = 1.0f - 0.6f * gen / gens;
@@ -262,8 +299,7 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir) {
         gs.swap(next);
     }
     fclose(hist);
-    snprintf(path, sizeof path, "%s/best.bin", out_dir);
-    FILE* f = fopen(path, "wb"); fwrite(&best_ever, sizeof(Genome), 1, f); fclose(f);
+    save_best(out_dir, &best_ever);
     // final population sorted (for showcase) — re-eval last gen already in gs? use archive + last sorted set
     CK(cudaMemcpy(d_gs, gs.data(), sizeof(Genome) * pop, cudaMemcpyHostToDevice));
     gpu_prepare(d_gs, pb, pop);
@@ -275,16 +311,10 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir) {
     }
     for (int i = 0; i < pop; i++) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](int a, int b) { return acc[a] > acc[b]; });
-    snprintf(path, sizeof path, "%s/pop.bin", out_dir);
-    f = fopen(path, "wb");
-    int n = pop; fwrite(&n, 4, 1, f);
-    for (int i = 0; i < pop; i++) fwrite(&gs[idx[i]], sizeof(Genome), 1, f);
-    fclose(f);
-    snprintf(path, sizeof path, "%s/archive.bin", out_dir);
-    f = fopen(path, "wb");
-    n = (int)archive.size(); fwrite(&n, 4, 1, f);
-    fwrite(archive.data(), sizeof(Genome), n, f);
-    fclose(f);
+    std::vector<Genome> srt(pop);
+    for (int i = 0; i < pop; i++) srt[i] = gs[idx[i]];
+    save_genomes(out_dir, "pop.bin", srt.data(), pop);
+    save_genomes(out_dir, "archive.bin", archive.data(), (int)archive.size());
     printf("best ever: %.2fm (saved %s/best.bin)\n", best_ever_f, out_dir);
     Genome* bg = &best_ever;
     printf("genome: span=%.3f chord=%.3f taper=%.2f sweep=%.2f dih_in=%.2f dih_out=%.2f kink=%.2f\n"

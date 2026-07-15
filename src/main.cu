@@ -32,7 +32,7 @@ static std::vector<Genome> load_pop(const char* p) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         printf("usage: planes <evolve|showcase|hero|turntable|stl> [opts]\n"
-               "  evolve    --pop 4096 --gens 400 --seeds 3 --out out\n"
+               "  evolve    --pop 4096 --gens 400 --seeds 3 --out out [--init out/pop.bin]\n"
                "  showcase  --pop-file out/pop.bin --n 300 --sec 12 --o out/showcase.mp4 --label text\n"
                "  hero      --best out/best.bin --sec 10 --o out/hero.mp4 --label text\n"
                "  turntable --best out/best.bin --sec 8 --o out/turntable.mp4 --label text\n"
@@ -42,7 +42,8 @@ int main(int argc, char** argv) {
     const char* mode = argv[1];
     if (!strcmp(mode, "evolve")) {
         run_ga(atoi(opt(argc, argv, "--pop", "4096")), atoi(opt(argc, argv, "--gens", "400")),
-               atoi(opt(argc, argv, "--seeds", "3")), opt(argc, argv, "--out", "out"));
+               atoi(opt(argc, argv, "--seeds", "3")), opt(argc, argv, "--out", "out"),
+               opt(argc, argv, "--init", nullptr));
     } else if (!strcmp(mode, "showcase")) {
         auto gs = load_pop(opt(argc, argv, "--pop-file", "out/pop.bin"));
         int n = atoi(opt(argc, argv, "--n", "300"));
