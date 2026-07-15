@@ -6,6 +6,11 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef _WIN32
+#define popen _popen
+#define pclose _pclose
+#endif
+
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     fprintf(stderr, "CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
 
@@ -21,7 +26,7 @@ static Cam make_cam(v3 pos, v3 target, float fov_deg) {
     c.fwd = norm3(sub(target, pos));
     c.right = norm3(cross(c.fwd, V3(0, 0, 1)));
     c.up = cross(c.right, c.fwd);
-    c.ty = tanf(fov_deg * 0.5f * (float)M_PI / 180.f);
+    c.ty = tanf(fov_deg * 0.5f * 3.14159265358979323846f / 180.f);
     c.tx = c.ty * (float)RW / RH;
     return c;
 }
@@ -182,13 +187,42 @@ __global__ void k_emit(const v3* verts, const int* tris, const int* nts,
     out[gi] = o;
 }
 
-#define RIBBON 70
+// Compact emitter: one block per plane and exact prefix-sum output ranges.  The
+// old flat MAX_T launch is retained for the one-plane turntable, while swarm
+// rendering avoids rasterizing hundreds of thousands of empty triangle slots.
+__global__ void k_emit_compact(const v3* verts, const int* tris, const int* nts,
+                               const int* offsets, const float8* rec, int rec_cap,
+                               int frame, int nplanes, RTri* out, int shadow) {
+    int p = blockIdx.x;
+    if (p >= nplanes) return;
+    float8 r = rec[p * rec_cap + frame];
+    for (int t = threadIdx.x; t < nts[p]; t += blockDim.x) {
+        RTri o;
+        v3 a = pose_xform(r, verts[p * MAX_V + tris[(p * MAX_T + t) * 3]]);
+        v3 b = pose_xform(r, verts[p * MAX_V + tris[(p * MAX_T + t) * 3 + 1]]);
+        v3 c = pose_xform(r, verts[p * MAX_V + tris[(p * MAX_T + t) * 3 + 2]]);
+        if (shadow) {
+            float k = fmaxf(0.f, 1.f - a.z * 0.9f);
+            o.col = pack_rgb(0.38f * k + 0.5f * (1-k), 0.47f * k + 0.6f * (1-k), 0.34f * k + 0.45f * (1-k));
+            a.z = b.z = c.z = 0.012f;
+        } else {
+            v3 n = norm3(cross(sub(b, a), sub(c, a)));
+            v3 L = norm3(V3(0.35f, 0.25f, 0.9f));
+            o.col = plane_color(p, nplanes, 0.35f + 0.65f * fabsf(dot(n, L)));
+        }
+        o.ax=a.x; o.ay=a.y; o.az=a.z; o.bx=b.x; o.by=b.y; o.bz=b.z; o.cx=c.x; o.cy=c.y; o.cz=c.z;
+        out[offsets[p] + t] = o;
+    }
+}
+
+#define RIBBON 240
+#define TRAIL_STRIDE 3
 __global__ void k_emit_ribbons(const float8* rec, int rec_cap, int frame, int nplanes, Cam cam, RTri* out) {
     int gi = blockIdx.x * blockDim.x + threadIdx.x;
     int p = gi / RIBBON, s = gi % RIBBON;
     if (p >= nplanes) return;
     RTri o1; o1.col = 0; RTri o2; o2.col = 0;
-    int f1 = frame - s, f0 = f1 - 1;
+    int f1 = frame - s * TRAIL_STRIDE, f0 = f1 - TRAIL_STRIDE;
     if (f0 >= 0 && f1 <= frame) {
         float8 ra = rec[p * rec_cap + f0], rb = rec[p * rec_cap + f1];
         if (rb.h > 0.5f) { // only while airborne
@@ -251,13 +285,24 @@ __global__ void k_emit_parts(const v3* pp, float t, int seed, Cam cam, RTri* out
 
 // ---------------- host drivers ----------------
 static FILE* open_ffmpeg(const char* path, const char* label) {
-    char cmd[1024];
+    char cmd[1400];
+#ifdef _WIN32
+    // Scoop ffmpeg builds may not ship a usable fontconfig setup. Keep the
+    // Windows pipe dependency-free; the simulation itself supplies the visual
+    // wind/path story and the filename/console retain scenario statistics.
+    (void)label;
+    snprintf(cmd, sizeof cmd,
+             "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
+             "-c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium \"%s\"",
+             RW, RH, FPS, path);
+#else
     snprintf(cmd, sizeof cmd,
              "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
              "-vf \"drawtext=text='%s':x=28:y=24:fontsize=30:fontcolor=white:box=1:boxcolor=black@0.35:boxborderw=10\" "
-             "-c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium '%s'",
+             "-c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium \"%s\"",
              RW, RH, FPS, label, path);
-    FILE* f = popen(cmd, "w");
+#endif
+    FILE* f = popen(cmd, "wb");
     if (!f) { fprintf(stderr, "ffmpeg spawn failed\n"); exit(1); }
     return f;
 }
@@ -265,12 +310,13 @@ static FILE* open_ffmpeg(const char* path, const char* label) {
 struct Recorded {
     int n, rec_cap;
     float8* d_rec;
-    v3* d_verts; int* d_tris; int* d_nts; int* d_nvs;
+    v3* d_verts; int* d_tris; int* d_nts; int* d_nvs; int* d_offsets;
+    int tri_count;
     std::vector<float8> h_rec;
     std::vector<float> fitness;
 };
 
-static Recorded record_flights(const Genome* genomes, int n, int seed, float spread, int seconds) {
+static Recorded record_flights(const Genome* genomes, int n, int seed, float spread, int seconds, int vary_scenarios) {
     Recorded R; R.n = n; R.rec_cap = seconds * FPS;
     Genome* d_gs; CK(cudaMalloc(&d_gs, sizeof(Genome) * n));
     CK(cudaMemcpy(d_gs, genomes, sizeof(Genome) * n, cudaMemcpyHostToDevice));
@@ -280,7 +326,7 @@ static Recorded record_flights(const Genome* genomes, int n, int seed, float spr
     CK(cudaMemset(R.d_rec, 0, sizeof(float8) * n * R.rec_cap));
     float* d_fit; CK(cudaMalloc(&d_fit, sizeof(float) * n));
     int rec_every = (int)(1.0f / (SIM_DT * FPS) + 0.5f); // 10
-    gpu_sim(pb, n, seed, d_fit, R.d_rec, rec_every, R.rec_cap, spread);
+    gpu_sim(pb, n, seed, d_fit, R.d_rec, rec_every, R.rec_cap, spread, vary_scenarios);
     R.fitness.resize(n);
     CK(cudaMemcpy(R.fitness.data(), d_fit, sizeof(float) * n, cudaMemcpyDeviceToHost));
     CK(cudaMalloc(&R.d_verts, sizeof(v3) * n * MAX_V));
@@ -289,20 +335,27 @@ static Recorded record_flights(const Genome* genomes, int n, int seed, float spr
     CK(cudaMalloc(&R.d_nvs, sizeof(int) * n));
     k_meshgen<<<n, 64>>>(d_gs, n, R.d_verts, R.d_tris, R.d_nvs, R.d_nts);
     CK(cudaDeviceSynchronize());
+    std::vector<int> h_nts(n), offsets(n + 1, 0);
+    CK(cudaMemcpy(h_nts.data(), R.d_nts, sizeof(int) * n, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < n; i++) offsets[i + 1] = offsets[i] + h_nts[i];
+    R.tri_count = offsets[n];
+    CK(cudaMalloc(&R.d_offsets, sizeof(int) * (n + 1)));
+    CK(cudaMemcpy(R.d_offsets, offsets.data(), sizeof(int) * (n + 1), cudaMemcpyHostToDevice));
     R.h_rec.resize((size_t)n * R.rec_cap);
     CK(cudaMemcpy(R.h_rec.data(), R.d_rec, sizeof(float8) * n * R.rec_cap, cudaMemcpyDeviceToHost));
+    panelbuf_free(pb); CK(cudaFree(d_fit)); CK(cudaFree(d_gs));
     return R;
 }
 
 static void render_frames(Recorded& R, int frames, const char* out, const char* label,
                           int mode /*0=showcase,1=hero*/, int wind_seed) {
-    int cap_planes = R.n * MAX_T;
+    int cap_planes = R.tri_count;
     int cap_rib = R.n * RIBBON * 2;
     int total = cap_planes * 2 + cap_rib + NPART;
     RTri* d_tris; CK(cudaMalloc(&d_tris, sizeof(RTri) * total));
     unsigned long long* d_zb; CK(cudaMalloc(&d_zb, sizeof(unsigned long long) * RW * RH));
     uint8_t* d_rgb; CK(cudaMalloc(&d_rgb, RW * RH * 3));
-    std::vector<uint8_t> h_rgb(RW * RH * 3);
+    uint8_t* h_rgb; CK(cudaHostAlloc(&h_rgb, RW * RH * 3, cudaHostAllocDefault));
     v3* d_pp; CK(cudaMalloc(&d_pp, sizeof(v3) * NPART));
     FILE* ff = open_ffmpeg(out, label);
     v3 cam_target = V3(4, 0, 1.5f); v3 prev_target = cam_target;
@@ -334,32 +387,46 @@ static void render_frames(Recorded& R, int frames, const char* out, const char* 
         }
         float simt = (float)f / FPS;
         k_clear<<<(RW * RH + 255) / 256, 256>>>(d_zb, cam);
-        k_emit<<<(cap_planes + 127) / 128, 128>>>(R.d_verts, R.d_tris, R.d_nts, R.d_rec, R.rec_cap, f, R.n, d_tris, 0);
-        k_emit<<<(cap_planes + 127) / 128, 128>>>(R.d_verts, R.d_tris, R.d_nts, R.d_rec, R.rec_cap, f, R.n, d_tris + cap_planes, 1);
+        k_emit_compact<<<R.n, 128>>>(R.d_verts, R.d_tris, R.d_nts, R.d_offsets, R.d_rec, R.rec_cap, f, R.n, d_tris, 0);
+        k_emit_compact<<<R.n, 128>>>(R.d_verts, R.d_tris, R.d_nts, R.d_offsets, R.d_rec, R.rec_cap, f, R.n, d_tris + cap_planes, 1);
         k_emit_ribbons<<<(R.n * RIBBON + 127) / 128, 128>>>(R.d_rec, R.rec_cap, f, R.n, cam, d_tris + cap_planes * 2);
         k_part_step<<<(NPART + 127) / 128, 128>>>(d_pp, simt, wind_seed, cam_target);
         k_emit_parts<<<(NPART + 127) / 128, 128>>>(d_pp, simt, wind_seed, cam, d_tris + cap_planes * 2 + cap_rib);
         k_raster<<<(total + 127) / 128, 128>>>(d_tris, total, d_zb, cam);
         k_resolve<<<(RW * RH + 255) / 256, 256>>>(d_zb, d_rgb);
-        CK(cudaMemcpy(h_rgb.data(), d_rgb, RW * RH * 3, cudaMemcpyDeviceToHost));
-        fwrite(h_rgb.data(), 1, h_rgb.size(), ff);
+        CK(cudaMemcpy(h_rgb, d_rgb, RW * RH * 3, cudaMemcpyDeviceToHost));
+        fwrite(h_rgb, 1, RW * RH * 3, ff);
         if (f % 120 == 0) { printf("frame %d/%d\n", f, frames); fflush(stdout); }
     }
     pclose(ff);
-    CK(cudaFree(d_tris)); CK(cudaFree(d_zb)); CK(cudaFree(d_rgb)); CK(cudaFree(d_pp));
+    CK(cudaFree(d_tris)); CK(cudaFree(d_zb)); CK(cudaFree(d_rgb)); CK(cudaFreeHost(h_rgb)); CK(cudaFree(d_pp));
+    CK(cudaFree(R.d_offsets)); CK(cudaFree(R.d_nts)); CK(cudaFree(R.d_nvs));
+    CK(cudaFree(R.d_tris)); CK(cudaFree(R.d_verts)); CK(cudaFree(R.d_rec));
 }
 
 void render_showcase(const Genome* genomes, int n, const char* out, int seconds, const char* label) {
-    Recorded R = record_flights(genomes, n, 4242, 0.55f, seconds);
+    Recorded R = record_flights(genomes, n, 4242, 0.55f, seconds, 1);
     float best = 0; for (float f : R.fitness) best = fmaxf(best, f);
     printf("showcase: %d planes, best in scene %.1fm\n", n, best);
     render_frames(R, seconds * FPS, out, label, 0, 4242);
 }
 
 void render_hero(const Genome* g, const char* out, int seconds, const char* label) {
-    Recorded R = record_flights(g, 1, 4242, 0, seconds);
+    Recorded R = record_flights(g, 1, 4242, 0, seconds, 0);
     printf("hero flight: %.1fm\n", R.fitness[0]);
     render_frames(R, seconds * FPS, out, label, 1, 4242);
+}
+
+void render_robust(const Genome* g, int scenarios, const char* out, int seconds, const char* label) {
+    if (scenarios < 4) scenarios = 4;
+    std::vector<Genome> copies(scenarios, *g);
+    Recorded R = record_flights(copies.data(), scenarios, 9001, 0.16f, seconds, 1);
+    std::vector<float> f = R.fitness;
+    std::sort(f.begin(), f.end());
+    float mean = 0; for (float x : f) mean += x / scenarios;
+    printf("robust video: %d environments, min %.1fm median %.1fm mean %.1fm max %.1fm\n",
+           scenarios, f.front(), f[f.size()/2], mean, f.back());
+    render_frames(R, seconds * FPS, out, label, 0, 9001);
 }
 
 // ---- turntable ----
@@ -375,7 +442,7 @@ void render_turntable(const Genome* g, const char* out, int seconds, const char*
     float8* d_rec; CK(cudaMalloc(&d_rec, sizeof(float8) * frames));
     std::vector<float8> h_rec(frames);
     for (int f = 0; f < frames; f++) {
-        float ang = 2.f * (float)M_PI * f / frames;
+        float ang = 2.f * 3.14159265358979323846f * f / frames;
         quat q = qaxis(V3(0, 0, 1), ang);
         float8 r; r.a = 0; r.b = 0; r.c = 0.16f; r.d = q.w; r.e = q.x; r.f = q.y; r.g = q.z; r.h = 1;
         h_rec[f] = r;
@@ -385,7 +452,7 @@ void render_turntable(const Genome* g, const char* out, int seconds, const char*
     RTri* d_rt; CK(cudaMalloc(&d_rt, sizeof(RTri) * cap * 2));
     unsigned long long* d_zb; CK(cudaMalloc(&d_zb, sizeof(unsigned long long) * RW * RH));
     uint8_t* d_rgb; CK(cudaMalloc(&d_rgb, RW * RH * 3));
-    std::vector<uint8_t> h_rgb(RW * RH * 3);
+    uint8_t* h_rgb; CK(cudaHostAlloc(&h_rgb, RW * RH * 3, cudaHostAllocDefault));
     FILE* ff = open_ffmpeg(out, label);
     for (int f = 0; f < frames; f++) {
         Cam cam = make_cam(V3(0.52f, 0.0f, 0.30f), V3(0, 0, 0.13f), 42);
@@ -394,8 +461,11 @@ void render_turntable(const Genome* g, const char* out, int seconds, const char*
         k_emit<<<(cap + 127) / 128, 128>>>(d_verts, d_tris, d_nts, d_rec, frames, f, 1, d_rt, 0);
         k_raster<<<(cap * 2 + 127) / 128, 128>>>(d_rt, cap * 2, d_zb, cam);
         k_resolve<<<(RW * RH + 255) / 256, 256>>>(d_zb, d_rgb);
-        CK(cudaMemcpy(h_rgb.data(), d_rgb, RW * RH * 3, cudaMemcpyDeviceToHost));
-        fwrite(h_rgb.data(), 1, h_rgb.size(), ff);
+        CK(cudaMemcpy(h_rgb, d_rgb, RW * RH * 3, cudaMemcpyDeviceToHost));
+        fwrite(h_rgb, 1, RW * RH * 3, ff);
     }
     pclose(ff);
+    CK(cudaFreeHost(h_rgb)); CK(cudaFree(d_rgb)); CK(cudaFree(d_zb)); CK(cudaFree(d_rt));
+    CK(cudaFree(d_rec)); CK(cudaFree(d_nts)); CK(cudaFree(d_nvs)); CK(cudaFree(d_tris));
+    CK(cudaFree(d_verts)); CK(cudaFree(d_g));
 }

@@ -1,71 +1,122 @@
 # planes-rl
 
-GPU-accelerated evolution of paper plane designs for maximum flight distance. Pure C++/CUDA: a parametric plane generator, a 6DOF panel-method flight simulator, a genetic algorithm, and a CUDA software rasterizer that renders the whole swarm to video — everything runs on the GPU (built for an RTX 5090, sm_120).
+CUDA-accelerated evolutionary design of hand-thrown, 3D-printable gliders. The optimizer generates aircraft, computes PLA mass properties, evaluates thousands of noisy 6DOF launches in parallel, and exports printable STL shells plus GPU-rendered videos.
 
-https://github.com/lee101/planes-rl/raw/main/media/showcase.mp4
+The optimizer is a genetic algorithm (rather than a policy-learning RL agent), but it performs the requested design search over a randomized flight environment.
 
-- `media/showcase.mp4` — 300 evolved planes launched into gusty wind, trajectory ribbons + wind streak particles
-- `media/hero.mp4` — chase cam on the best design
-- `media/turntable.mp4` — turntable of the champion design
-- `media/plane.stl` — downloadable solid-shell STL of the champion (mm units)
+## Current design target
 
-## How it works
+- Maximum build envelope: **250 x 250 x 250 mm**.
+- Material: ordinary PLA at **1240 kg/m3**.
+- Optimization wall: **0.45 mm** single-wall shell (`PLA_WALL_M`).
+- Typical included designs: roughly 15-22 g including parameterized nose ballast.
+- Hand launch domain: 7.2-11.2 m/s, varied release pitch/yaw/roll and height, release angular rates, calm-to-severe gust fields, head/tailwind, crosswind, air density, and skin drag.
+- Tail-aware objective: 55% mean distance, 30% worst-quartile CVaR, and 15% single worst case. Oversize designs receive a hard negative fitness.
+- Champion selection uses an independent 128-scenario GPU holdout suite every generation, preventing lucky training specialists from becoming `best.bin`.
 
-### Parametric plane genome (16 genes)
+## Geometry
 
-Every plane is generated from a 16-float genome (`src/common.h`): wingspan, root chord, taper, leading-edge sweep, two-segment dihedral (inner panel + winglet angle with a movable kink station), **cubic-bezier chordwise camber** (two control points + trailing-edge reflex/elevator), spanwise washout twist, nose ballast mass, keel depth, center body width, and **biplane genes** (deck gap + upper-deck scale — the optimizer is free to discover double-decker designs). The genome maps to a triangle mesh (~170-340 panels): wing surface grid with piecewise dihedral polyline, folded keel sheet, and optional second deck with struts.
+A 16-float genome controls span, chord, taper, sweep, inner/outer dihedral, winglet kink, cubic camber, washout, trailing-edge reflex, nose ballast, keel, center-body width, and an optional second wing deck. Meshes contain about 166 triangles for a monoplane or 330 for a biplane before STL shell thickening.
 
-Mass properties are computed from the mesh as a thin shell (80 gsm paper) plus point ballast at the nose; center of mass, inertia tensor, and its inverse are derived per design on-device.
+`mass_props()` treats every aerodynamic triangle as a uniform extruded PLA lamina. It integrates triangle second moments, includes through-thickness inertia, adds the nose ballast, then computes center of mass and the full inverse inertia tensor. STL mass reporting scales with the requested export thickness.
 
-### Flight simulation (CUDA, one block per plane)
+## Robust GPU flight simulation
 
-6DOF rigid body integration (semi-implicit Euler, dt = 1/600 s, quaternion attitude) with per-panel aerodynamics:
+Each CUDA block owns one plane. Threads stride its panels, calculate local relative flow including rotational velocity, reduce force/torque with warp shuffles, and integrate a 6DOF rigid body at 600 Hz. Kernels run in one-second chunks to avoid long uninterruptible launches.
 
-- Per panel: relative velocity `v_rel = v + ω×r − wind(x, t)`, signed inflow `s = v̂·n`
-- Normal force blends attached thin-airfoil flow with Newtonian flat-plate stall:
-  `C_N = 1.9·s·√(1−s²) + 2·s·|s|` — gives realistic lift slope at small angles of attack and post-stall behavior, orientation-free (paper sheets fly either side up)
-- Skin friction on the tangential component
-- Rotational damping falls out naturally because each panel sees `ω×r`
-- Wind field: light headwind/crosswind base + 3-octave sinusoidal gusts in space and time, seeded per evaluation
+For each evaluation seed, every candidate receives the same deterministic imperfect throw, preserving fair rankings. Across seeds the optimizer sees different:
 
-Kernel layout: one thread block per plane, 128 threads striding panels, warp-shuffle + shared-memory reduction of force/torque, thread 0 integrates. State stays in shared memory for a whole chunk (600 steps ≈ 1 s of sim per launch — kernels stay short and preemptible, which also keeps the driver/GSP happy). Fitness = horizontal distance when the plane hits the ground, averaged over 3 wind seeds per generation to force robust designs, launched at 9.5 m/s from 1.8 m.
+- launch speed and release height;
+- pitch, yaw, and roll errors;
+- pitch/roll/yaw release rates;
+- steady wind and multi-octave gust fields.
 
-Throughput: a full generation (8192 planes × 3 winds × up to 7200 steps × ~200 panels) evaluates in a fraction of a second on a 5090 — planes fan out across all SMs and dead planes retire their blocks early.
+Use at least 8 seeds for serious robust optimization.
 
-### Genetic algorithm
+## GPU renderer
 
-Population 8192, tournament-4 selection, blend crossover (extrapolating lerp), annealed per-gene gaussian mutation, elitism, 5% random immigrants per generation, rotating wind seeds each generation so nothing overfits one gust pattern. Best-of-generation archive is kept for the showcase scene.
+The renderer is CUDA-only: procedural sky/ground, shadows, flight ribbons, wind particles, and a packed 64-bit atomic depth/color buffer streamed to `ffmpeg`. Swarm rendering uses exact per-plane triangle prefix ranges instead of rasterizing `MAX_T` empty slots for every aircraft, and frame readback uses pinned host memory.
 
-### Visualization (CUDA software rasterizer)
+## Build
 
-No OpenGL — the renderer is also CUDA: procedural sky + checkered ground with 5 m distance lines computed per pixel by ray cast, then one thread per triangle rasterizes with perspective-correct depth into a 64-bit atomicMin z-buffer (depth in the high word, RGBA in the low word — depth test and write are a single atomic). The scene draws:
-
-- every plane's mesh, posed from recorded sim states (60 fps pose capture), lambert-shaded, HSV-ranked colors
-- projected ground shadows
-- fading trajectory ribbons (camera-facing quad strips)
-- 6000 wind streak particles advected through the same wind field the planes feel
-
-Frames stream straight from the GPU into an `ffmpeg` rawvideo pipe → H.264. The turntable mode orbits the champion mesh; STL export offsets the sheet ±0.3 mm along vertex normals and stitches boundary edges into a watertight-ish solid shell for printing.
-
-## Build + run
+Requires CUDA, a compatible NVIDIA GPU, a C++17 host compiler, and `ffmpeg`.
 
 ```bash
-make            # nvcc -O3 -use_fast_math -arch=sm_120
-make evolve     # GA: pop 8192, 3000 generations, 3 wind seeds -> out/best.bin, out/pop.bin, out/history.csv
-make videos     # showcase (300 planes), hero chase cam, turntable
-make stl        # out/plane.stl
+make                         # uses -arch=native for the installed GPU
+./planes                     # print CLI help
 ```
 
-CLI details: `./planes` with no args prints all modes/options.
+Override `ARCH` for another GPU, for example `sm_89` on Ada.
 
-## 5090 / performance notes
+## Quick start
 
-- FP32 state + `-use_fast_math`; aero inner loop is FMA-dense and register-resident, panels read via coalesced `float4` SoA
-- Warp shuffle reductions, shared-memory block reduce, zero global traffic inside a timestep except panel reads
-- Mesh building, mass properties, 3×3 inertia inversion all happen in device kernels — genomes are the only host↔device traffic in the GA loop (32 KB per generation up, 32 KB fitness down)
-- Short chunked kernel launches instead of one mega-kernel per flight: same throughput, far better citizen on a shared/oversubscribed GPU
-- FP4/FP16: deliberately not used for physics state — 6DOF integration over 7200 steps is numerically unforgiving and the sim is compute-bound on FMAs, not bandwidth; quantization would buy nothing here. The rasterizer's packed 64-bit z-buffer atomics are the bandwidth-bound part and already 8-byte packed.
+Generate five printable baseline designs and a warm-start population:
 
-## Results
+```bash
+make presets
+# out/presets/stable_gull.stl
+# out/presets/fast_dart.stl
+# out/presets/efficient_plank.stl
+# out/presets/boxy_biplane.stl
+# out/presets/compact_trainer.stl
+# out/presets/seeds.bin
+```
 
-See `out/history.csv` for the fitness curve and the release/media files for the evolved champion. Genome + measured distances are printed at the end of `make evolve`.
+Run a small smoke optimization:
+
+```bash
+./planes evolve --pop 1024 --gens 50 --seeds 8 --out out/run1 \
+  --init out/presets/seeds.bin
+```
+
+Run the full search:
+
+```bash
+./planes evolve --pop 8192 --gens 3000 --seeds 8 --out out \
+  --init out/presets/seeds.bin
+```
+
+Audit the champion across thousands of independent environments, then inspect and export it:
+
+```bash
+./planes evaluate --best out/best.bin --n 4096 --seed 9001 \
+  --o out/robustness-4096.csv
+./planes inspect --best out/best.bin
+./planes stl --best out/best.bin --o out/plane.stl --th 0.45
+```
+
+An STL export is refused if any mesh dimension exceeds 250 mm. Use the same wall thickness used by optimization unless deliberately testing a heavier build.
+
+Render results, including one champion launched through 96 independent hostile environments with long trajectory trails:
+
+```bash
+./planes showcase --pop-file out/pop.bin --n 300 --sec 12 \
+  --o out/showcase.mp4 --label "planes-rl - robust PLA gliders"
+./planes hero --best out/best.bin --sec 10 --o out/hero.mp4
+./planes robust-video --best out/best.bin --n 96 --sec 12 \
+  --o out/robust.mp4 --label "one design - 96 winds and imperfect throws"
+./planes turntable --best out/best.bin --sec 8 --o out/turntable.mp4
+```
+
+`archive.bin` has one generation champion per entry and can also be passed to `showcase` to visualize how the design family changes during optimization.
+
+## Outputs
+
+- `best.bin`: best robust genome seen.
+- `pop.bin`: final population sorted by evaluation score.
+- `archive.bin`: generation champions, suitable for an evolution showcase.
+- `history.csv`: training-best, independent 128-scenario holdout, population mean, and top-decile score by generation.
+- `robustness-*.csv`: per-scenario distance plus launch, density, drag, gust, and base-wind telemetry.
+- STL and MP4 outputs selected through the CLI.
+
+## External reference aircraft
+
+See `REFERENCE_MODELS.md` for downloadable community gliders worth comparing against. They are linked rather than vendored so their individual licenses and attribution requirements remain explicit. Arbitrary STL geometry is not yet converted into the 16-gene search space; use reference models for physical baselines, or fit their proportions into a preset genome.
+
+## Important physical limitations
+
+This is a fast panel model, not CFD or a slicer. It does not yet model layer-line anisotropy, impact breakage, nozzle corner rounding, support scars, infill, or aeroelastic wing bending. Validate finalists with a slicer and real throws, then feed measured mass/CG and launch data back into the constants or future calibration tooling.
+
+## Windows toolchain
+
+Install Visual Studio 2022 Build Tools with the C++ workload, CUDA Toolkit, GNU Make, and ffmpeg. The Makefile uses `-arch=native`, emits `planes.exe`, avoids Linux-only `flock`, and the renderer maps `popen` to `_popen`. Run `./build-windows.ps1`; it discovers Visual Studio Build Tools, initializes the MSVC environment, finds the Scoop `nvcc` shim, and compiles for the local RTX 3070 (`sm_86`). Pass `-Arch sm_120` on the RTX 5090 host.

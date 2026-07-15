@@ -9,6 +9,12 @@ void export_stl(const Genome* g, const char* path, float thickness_mm) {
     v3 V[MAX_V]; int T[MAX_T][3]; MeshOut mo;
     build_mesh(g, V, T, &mo);
     MassProps mp; mass_props(g, V, T, mo.nt, &mp);
+    v3 ext = mesh_extent(V, mo.nv);
+    if (!fits_print_volume(V, mo.nv, PRINT_VOLUME_M - thickness_mm * 0.001f)) {
+        fprintf(stderr, "refusing STL outside 250 mm build volume: %.1f x %.1f x %.1f mm\n",
+                ext.x * 1000, ext.y * 1000, ext.z * 1000);
+        return;
+    }
     for (int i = 0; i < mo.nv; i++) V[i] = sub(V[i], mp.com);
     std::vector<v3> vn(mo.nv, V3(0, 0, 0));
     for (int t = 0; t < mo.nt; t++) {
@@ -49,7 +55,8 @@ void export_stl(const Genome* g, const char* path, float thickness_mm) {
             }
         }
     FILE* f = fopen(path, "wb");
-    char hdr[80] = "planes-rl evolved paper plane (units: mm)";
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); return; }
+    char hdr[80] = "planes-rl evolved printable PLA glider (units: mm)";
     fwrite(hdr, 80, 1, f);
     uint32_t n = (uint32_t)out.size();
     fwrite(&n, 4, 1, f);
@@ -63,5 +70,8 @@ void export_stl(const Genome* g, const char* path, float thickness_mm) {
         uint16_t attr = 0; fwrite(&attr, 2, 1, f);
     }
     fclose(f);
-    printf("stl: %u tris -> %s (mass %.1f g, span %.0f mm)\n", n, path, mp.mass * 1000, g->span * 1000);
+    float actual_mass = mp.mass * (thickness_mm * 0.001f / PLA_WALL_M);
+    printf("stl: %u tris -> %s (PLA %.1f g @ %.2f mm, bounds %.0f x %.0f x %.0f mm)\n",
+           n, path, actual_mass * 1000, thickness_mm,
+           ext.x * 1000, ext.y * 1000, ext.z * 1000);
 }

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <random>
 #include <vector>
+#include <filesystem>
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     fprintf(stderr, "CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
@@ -31,8 +32,9 @@ __global__ void k_prepare(const Genome* gs, PanelBuf pb, int pop) {
         Genome g = gs[i];
         build_mesh(&g, V, T, &mo);
         MassProps mp; mass_props(&g, V, T, mo.nt, &mp);
-        pb.mp[i] = mp; pb.nt[i] = mo.nt;
-        s_mp = mp; s_nt = mo.nt;
+        int printable = fits_print_volume(V, mo.nv, PRINT_VOLUME_M - PLA_WALL_M);
+        pb.mp[i] = mp; pb.nt[i] = printable ? mo.nt : 0;
+        s_mp = mp; s_nt = printable ? mo.nt : 0;
     }
     __syncthreads();
     for (int t = threadIdx.x; t < s_nt; t += blockDim.x) {
@@ -52,15 +54,18 @@ __global__ void k_prepare(const Genome* gs, PanelBuf pb, int pop) {
 // record: optional pose recording every rec_every steps into rec[plane*rec_cap + f] = {pos, quat, alive}
 __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
                       float8* rec, int rec_every, int rec_cap, float launch_spread,
-                      PlaneState* st, int step0, int nsteps) {
+                      int vary_scenarios, PlaneState* st, int step0, int nsteps) {
     int p = blockIdx.x;
     int tid = threadIdx.x;
     __shared__ v3 s_pos, s_vel, s_wb; __shared__ quat s_q;
-    __shared__ float s_done, s_t;
+    __shared__ float s_done, s_t, s_air_rho, s_skin_cf;
     __shared__ float rF[3][BLK / 32], rT[3][BLK / 32];
     MassProps mp = pb.mp[p];
     int nt = pb.nt[p];
+    int env_seed = seed + (vary_scenarios ? p * 7919 : 0);
     if (tid == 0) {
+        ScenarioDesc env = scenario_desc(env_seed);
+        s_air_rho = env.air_rho; s_skin_cf = env.skin_cf;
         if (step0 == 0) {
             // staggered launch grid for showcase (spread=0 for GA)
             float ox = 0, oy = 0, oz = 0;
@@ -70,12 +75,22 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
                 ox = -(p / cols) * launch_spread * 1.4f;
                 oz = 0.25f * sinf(p * 12.9898f);
             }
-            s_pos = V3(ox, oy, LAUNCH_H + oz);
-            s_q = Q(1, 0, 0, 0);
-            float jv = launch_spread > 0 ? 0.35f * sinf(p * 78.233f) : 0;
-            s_vel = V3((LAUNCH_V + jv) * cosf(LAUNCH_PITCH), 0, (LAUNCH_V + jv) * sinf(LAUNCH_PITCH));
-            s_wb = V3(0, 0, 0);
-            s_done = 0; s_t = 0;
+            // Domain-randomized hand throw. Every genome sees the same scenario for
+            // a given seed, preserving fair GA ranking; showcase spread adds a small
+            // per-plane visual variation without changing the training distribution.
+            int launch_seed = env_seed;
+            ScenarioDesc launch = scenario_desc(launch_seed);
+            float speed = launch.speed, pitch = launch.pitch;
+            float yaw = launch.yaw, roll = launch.roll, height = launch.height;
+            s_pos = V3(ox, oy, height + oz);
+            quat qyaw = qaxis(V3(0, 0, 1), yaw);
+            quat qpitch = qaxis(V3(0, 1, 0), -pitch);
+            quat qroll = qaxis(V3(1, 0, 0), roll);
+            s_q = qnorm(qmul(qyaw, qmul(qpitch, qroll)));
+            s_vel = qrot(qmul(qyaw, qpitch), V3(speed, 0, 0));
+            s_wb = V3(launch.roll_rate, launch.pitch_rate, launch.yaw_rate);
+            s_done = nt <= 0 ? 1.0f : 0.0f; s_t = 0;
+            if (nt <= 0) fitness[p] = -100.0f;
         } else {
             PlaneState s = st[p];
             s_pos = s.pos; s_q = s.q; s_vel = s.vel; s_wb = s.wb;
@@ -98,7 +113,7 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
         v3 r0, r1, r2; qmat(s_q, &r0, &r1, &r2);
         v3 vel = s_vel, wb = s_wb, pos = s_pos;
         v3 ww = V3(dot(r0, wb), dot(r1, wb), dot(r2, wb)); // omega world
-        v3 wind = wind_at(pos, s_t, seed);
+        v3 wind = wind_at(pos, s_t, env_seed);
         v3 F = V3(0, 0, 0), Tq = V3(0, 0, 0);
         for (int t = tid; t < nt; t += BLK) {
             float4 c4 = pb.pc[p * MAX_T + t], n4 = pb.pn[p * MAX_T + t];
@@ -112,11 +127,11 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
             float Vm = sqrtf(V2);
             v3 vh = scl(vr, 1.0f / Vm);
             float s = dot(vh, nw);
-            float qd = 0.5f * AIR_RHO * V2 * A;
+            float qd = 0.5f * s_air_rho * V2 * A;
             float cn = CN_SLOPE * s * sqrtf(fmaxf(0.f, 1.f - s * s)) + 2.0f * s * fabsf(s);
             v3 f = scl(nw, -qd * cn);
             v3 tang = sub(vh, scl(nw, s));
-            f = sub(f, scl(tang, qd * CF_FRICTION));
+            f = sub(f, scl(tang, qd * s_skin_cf));
             F = add(F, f);
             Tq = add(Tq, cross(rw, f));
         }
@@ -190,17 +205,85 @@ void* panelbuf_alloc(int pop) {
     return pb;
 }
 
+void panelbuf_free(void* pbv) {
+    if (!pbv) return;
+    PanelBuf* pb = (PanelBuf*)pbv;
+    CK(cudaFree(pb->pc)); CK(cudaFree(pb->pn)); CK(cudaFree(pb->mp));
+    CK(cudaFree(pb->nt)); CK(cudaFree(pb->st)); delete pb;
+}
+
 // chunked launches (~1s sim each) keep kernels short: GSP/driver friendly, preemptible
 void gpu_sim(void* pbv, int pop, int seed, float* d_fitness,
-             float8* d_rec, int rec_every, int rec_cap, float spread) {
+             float8* d_rec, int rec_every, int rec_cap, float spread, int vary_scenarios) {
     PanelBuf* pb = (PanelBuf*)pbv;
     const int CHUNK = 600;
     for (int s0 = 0; s0 < SIM_MAX_STEPS; s0 += CHUNK) {
         k_sim<<<pop, BLK>>>(*pb, pop, seed, d_fitness, d_rec, rec_every, rec_cap, spread,
-                            pb->st, s0, CHUNK);
+                            vary_scenarios, pb->st, s0, CHUNK);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
     }
+}
+
+static float percentile(const std::vector<float>& sorted, float q) {
+    if (sorted.empty()) return 0;
+    float x = q * (sorted.size() - 1);
+    int a = (int)floorf(x), b = (int)ceilf(x);
+    float t = x - a;
+    return sorted[a] * (1.0f - t) + sorted[b] * t;
+}
+
+void evaluate_design(const Genome* g, int scenarios, int base_seed, const char* csv_path) {
+    if (scenarios < 8) scenarios = 8;
+    std::vector<Genome> gs(scenarios, *g);
+    Genome* d_gs; float* d_fit;
+    CK(cudaMalloc(&d_gs, sizeof(Genome) * scenarios));
+    CK(cudaMalloc(&d_fit, sizeof(float) * scenarios));
+    CK(cudaMemcpy(d_gs, gs.data(), sizeof(Genome) * scenarios, cudaMemcpyHostToDevice));
+    void* pb = panelbuf_alloc(scenarios);
+    gpu_prepare(d_gs, pb, scenarios);
+    gpu_sim(pb, scenarios, base_seed, d_fit, nullptr, 1, 0, 0, 1);
+    std::vector<float> distances(scenarios);
+    CK(cudaMemcpy(distances.data(), d_fit, sizeof(float) * scenarios, cudaMemcpyDeviceToHost));
+
+    std::filesystem::path out(csv_path);
+    if (out.has_parent_path()) std::filesystem::create_directories(out.parent_path());
+    FILE* f = fopen(csv_path, "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", csv_path); }
+    else {
+        fprintf(f, "scenario,seed,distance_m,speed_mps,height_m,pitch_deg,yaw_deg,roll_deg,roll_rate,pitch_rate,yaw_rate,air_density,skin_cf,gust_scale,base_wind_x,base_wind_y\n");
+        for (int i = 0; i < scenarios; i++) {
+            int seed = base_seed + i * 7919;
+            ScenarioDesc d = scenario_desc(seed);
+            const float rad2deg = 57.2957795131f;
+            fprintf(f, "%d,%d,%.6f,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                    i, seed, distances[i], d.speed, d.height, d.pitch*rad2deg, d.yaw*rad2deg, d.roll*rad2deg,
+                    d.roll_rate, d.pitch_rate, d.yaw_rate, d.air_rho, d.skin_cf, d.gust, d.base_x, d.base_y);
+        }
+        fclose(f);
+    }
+
+    std::vector<float> sorted = distances;
+    std::sort(sorted.begin(), sorted.end());
+    float mean = 0, sq = 0;
+    for (float x : sorted) { mean += x / scenarios; sq += x*x / scenarios; }
+    float sd = sqrtf(fmaxf(0.0f, sq - mean*mean));
+    int tail_n = std::max(1, scenarios / 10), failures = 0;
+    float cvar10 = 0;
+    for (int i = 0; i < tail_n; i++) cvar10 += sorted[i] / tail_n;
+    for (float x : sorted) if (x < 0.0f) failures++;
+
+    v3 V[MAX_V]; int T[MAX_T][3]; MeshOut mo; build_mesh(g, V, T, &mo);
+    MassProps mp; mass_props(g, V, T, mo.nt, &mp); v3 ext = mesh_extent(V, mo.nv);
+    printf("robustness audit: %d GPU scenarios -> %s\n", scenarios, csv_path);
+    printf("  min %.2fm  p05 %.2fm  p10 %.2fm  p25 %.2fm  median %.2fm\n",
+           sorted.front(), percentile(sorted,.05f), percentile(sorted,.10f), percentile(sorted,.25f), percentile(sorted,.50f));
+    printf("  mean %.2fm  sd %.2fm  p75 %.2fm  p90 %.2fm  p95 %.2fm  max %.2fm\n",
+           mean, sd, percentile(sorted,.75f), percentile(sorted,.90f), percentile(sorted,.95f), sorted.back());
+    printf("  CVaR10 %.2fm  failures %d/%d  PLA %.1fg  bounds %.0fx%.0fx%.0fmm\n",
+           cvar10, failures, scenarios, mp.mass*1000, ext.x*1000, ext.y*1000, ext.z*1000);
+
+    panelbuf_free(pb); CK(cudaFree(d_fit)); CK(cudaFree(d_gs));
 }
 
 // ---------------- GA (host) ----------------
@@ -210,6 +293,10 @@ static inline void gset(Genome* g, int i, float v) { ((float*)g)[i] = fminf(G_HI
 static void grand(Genome* g, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(0, 1);
     for (int i = 0; i < GENOME_N; i++) gset(g, i, G_LO[i] + u(rng) * (G_HI[i] - G_LO[i]));
+}
+
+static void sanitize(Genome* g) {
+    for (int i = 0; i < GENOME_N; i++) gset(g, i, gget(g, i));
 }
 
 static void save_best(const char* out_dir, const Genome* g) {
@@ -225,7 +312,30 @@ static void save_genomes(const char* out_dir, const char* name, const Genome* gs
     fwrite(&n, 4, 1, f); fwrite(gs, sizeof(Genome), n, f); fclose(f);
 }
 
+static void robust_scores(const std::vector<float>& samples, int pop, int nseeds,
+                          std::vector<float>& scores) {
+    std::vector<float> row(nseeds);
+    int tail_n = (nseeds + 3) / 4; // worst quartile, at least one scenario
+    for (int i = 0; i < pop; i++) {
+        float mean = 0;
+        for (int s = 0; s < nseeds; s++) {
+            row[s] = samples[(size_t)i * nseeds + s];
+            mean += row[s] / nseeds;
+        }
+        std::sort(row.begin(), row.end());
+        float cvar25 = 0;
+        for (int s = 0; s < tail_n; s++) cvar25 += row[s] / tail_n;
+        // Tail-aware objective: ordinary performance still matters, but half the
+        // pressure is on ugly releases and the single most hostile case.
+        scores[i] = 0.55f * mean + 0.30f * cvar25 + 0.15f * row[0];
+    }
+}
+
 void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init_path) {
+    if (pop < 2 || gens < 1 || nseeds < 1) {
+        fprintf(stderr, "evolve requires pop>=2, gens>=1, seeds>=1\n"); return;
+    }
+    std::filesystem::create_directories(out_dir);
     std::mt19937 rng(42);
     std::vector<Genome> gs(pop), next(pop);
     for (auto& g : gs) grand(&g, rng);
@@ -235,40 +345,58 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init
             int n = 0; fread(&n, 4, 1, f);
             if (n > pop) n = pop;
             fread(gs.data(), sizeof(Genome), n, f); fclose(f);
-            printf("warm start: %d genomes from %s\n", n, init_path);
+            for (int i = 0; i < n; i++) sanitize(&gs[i]);
+            printf("warm start: %d genomes from %s (clamped to printable bounds)\n", n, init_path);
         }
     }
     Genome* d_gs; float* d_fit;
     CK(cudaMalloc(&d_gs, sizeof(Genome) * pop));
     CK(cudaMalloc(&d_fit, sizeof(float) * pop));
     void* pb = panelbuf_alloc(pop);
-    std::vector<float> fit(pop), acc(pop);
+    const int VAL_N = 128;
+    Genome* d_val_gs; float* d_val_fit; void* val_pb = panelbuf_alloc(VAL_N);
+    CK(cudaMalloc(&d_val_gs, sizeof(Genome) * VAL_N));
+    CK(cudaMalloc(&d_val_fit, sizeof(float) * VAL_N));
+    std::vector<Genome> val_gs(VAL_N);
+    std::vector<float> val_fit(VAL_N), val_score(1);
+    std::vector<float> fit(pop), acc(pop), samples((size_t)pop * nseeds);
     std::vector<int> idx(pop);
     Genome best_ever; float best_ever_f = -1e9f;
     std::vector<Genome> archive;
     char path[512];
     snprintf(path, sizeof path, "%s/history.csv", out_dir);
     FILE* hist = fopen(path, "w");
-    fprintf(hist, "gen,best,mean,p90\n");
+    fprintf(hist, "gen,train_best,holdout128,mean,p90\n");
     std::uniform_real_distribution<float> u01(0, 1);
     std::normal_distribution<float> nrm(0, 1);
     for (int gen = 0; gen < gens; gen++) {
         CK(cudaMemcpy(d_gs, gs.data(), sizeof(Genome) * pop, cudaMemcpyHostToDevice));
         gpu_prepare(d_gs, pb, pop);
-        std::fill(acc.begin(), acc.end(), 0.f);
         for (int s = 0; s < nseeds; s++) {
-            gpu_sim(pb, pop, gen * nseeds + s + 1, d_fit, nullptr, 1, 0, 0);
+            gpu_sim(pb, pop, gen * nseeds + s + 1, d_fit, nullptr, 1, 0, 0, 0);
             CK(cudaMemcpy(fit.data(), d_fit, sizeof(float) * pop, cudaMemcpyDeviceToHost));
-            for (int i = 0; i < pop; i++) acc[i] += fit[i] / nseeds;
+            for (int i = 0; i < pop; i++) samples[(size_t)i * nseeds + s] = fit[i];
         }
+        robust_scores(samples, pop, nseeds, acc);
         for (int i = 0; i < pop; i++) idx[i] = i;
         std::sort(idx.begin(), idx.end(), [&](int a, int b) { return acc[a] > acc[b]; });
         float mean = 0; for (int i = 0; i < pop; i++) mean += acc[i] / pop;
-        fprintf(hist, "%d,%.3f,%.3f,%.3f\n", gen, acc[idx[0]], mean, acc[idx[pop / 10]]);
+        // Independent, much larger holdout suite for champion selection. This is
+        // batched as 128 copies of one genome, so it adds little GPU cost while
+        // preventing a lucky eight-scenario specialist from becoming best.bin.
+        std::fill(val_gs.begin(), val_gs.end(), gs[idx[0]]);
+        CK(cudaMemcpy(d_val_gs, val_gs.data(), sizeof(Genome) * VAL_N, cudaMemcpyHostToDevice));
+        gpu_prepare(d_val_gs, val_pb, VAL_N);
+        gpu_sim(val_pb, VAL_N, 100003, d_val_fit, nullptr, 1, 0, 0, 1);
+        CK(cudaMemcpy(val_fit.data(), d_val_fit, sizeof(float) * VAL_N, cudaMemcpyDeviceToHost));
+        robust_scores(val_fit, 1, VAL_N, val_score);
+        float holdout = val_score[0];
+        fprintf(hist, "%d,%.3f,%.3f,%.3f,%.3f\n", gen, acc[idx[0]], holdout, mean, acc[idx[pop / 10]]);
         fflush(hist);
         if (gen % 10 == 0 || gen == gens - 1)
-            printf("gen %4d best %7.2fm mean %7.2fm p90 %7.2fm\n", gen, acc[idx[0]], mean, acc[idx[pop / 10]]);
-        if (acc[idx[0]] > best_ever_f) { best_ever_f = acc[idx[0]]; best_ever = gs[idx[0]]; }
+            printf("gen %4d train %7.2fm holdout %7.2fm mean %7.2fm p90 %7.2fm\n",
+                   gen, acc[idx[0]], holdout, mean, acc[idx[pop / 10]]);
+        if (holdout > best_ever_f) { best_ever_f = holdout; best_ever = gs[idx[0]]; }
         archive.push_back(gs[idx[0]]);
         if (gen % 25 == 24) { // checkpoint: GPU crash mid-run keeps artifacts
             save_best(out_dir, &best_ever);
@@ -303,23 +431,25 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init
     // final population sorted (for showcase) — re-eval last gen already in gs? use archive + last sorted set
     CK(cudaMemcpy(d_gs, gs.data(), sizeof(Genome) * pop, cudaMemcpyHostToDevice));
     gpu_prepare(d_gs, pb, pop);
-    std::fill(acc.begin(), acc.end(), 0.f);
     for (int s = 0; s < nseeds; s++) {
-        gpu_sim(pb, pop, 777 + s, d_fit, nullptr, 1, 0, 0);
+        gpu_sim(pb, pop, 777 + s, d_fit, nullptr, 1, 0, 0, 0);
         CK(cudaMemcpy(fit.data(), d_fit, sizeof(float) * pop, cudaMemcpyDeviceToHost));
-        for (int i = 0; i < pop; i++) acc[i] += fit[i] / nseeds;
+        for (int i = 0; i < pop; i++) samples[(size_t)i * nseeds + s] = fit[i];
     }
+    robust_scores(samples, pop, nseeds, acc);
     for (int i = 0; i < pop; i++) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](int a, int b) { return acc[a] > acc[b]; });
     std::vector<Genome> srt(pop);
     for (int i = 0; i < pop; i++) srt[i] = gs[idx[i]];
     save_genomes(out_dir, "pop.bin", srt.data(), pop);
     save_genomes(out_dir, "archive.bin", archive.data(), (int)archive.size());
-    printf("best ever: %.2fm (saved %s/best.bin)\n", best_ever_f, out_dir);
+    printf("best holdout score: %.2fm (saved %s/best.bin)\n", best_ever_f, out_dir);
     Genome* bg = &best_ever;
     printf("genome: span=%.3f chord=%.3f taper=%.2f sweep=%.2f dih_in=%.2f dih_out=%.2f kink=%.2f\n"
            "        camber=(%.3f,%.3f) washout=%.3f elev=%.3f nose=%.2f keel=%.3f deck=(%.3f,%.2f) body=%.2f\n",
            bg->span, bg->chord, bg->taper, bg->sweep, bg->dihedral_in, bg->dihedral_out, bg->kink,
            bg->camber1, bg->camber2, bg->washout, bg->elevator, bg->nose_mass, bg->keel_h,
            bg->deck_gap, bg->deck_scale, bg->body_frac);
+    panelbuf_free(val_pb); CK(cudaFree(d_val_fit)); CK(cudaFree(d_val_gs));
+    panelbuf_free(pb); CK(cudaFree(d_fit)); CK(cudaFree(d_gs));
 }

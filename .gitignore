@@ -1,3 +1,9 @@
 planes
 *.o
 out/*.bin
+out/*.exe
+planes.exe
+out/**/*.bin
+out/**/*.stl
+out/**/*.csv
+out/**/*.log
