@@ -60,11 +60,12 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
     __shared__ v3 s_pos, s_vel, s_wb; __shared__ quat s_q;
     __shared__ float s_done, s_t, s_air_rho, s_skin_cf;
     __shared__ float rF[3][BLK / 32], rT[3][BLK / 32];
-    MassProps mp = pb.mp[p];
     int nt = pb.nt[p];
     int env_seed = seed + (vary_scenarios ? p * 7919 : 0);
+    ScenarioDesc env = scenario_desc(env_seed);
+    v3 cg_shift;
+    MassProps mp = printed_mass_props(pb.mp[p], env, &cg_shift);
     if (tid == 0) {
-        ScenarioDesc env = scenario_desc(env_seed);
         s_air_rho = env.air_rho; s_skin_cf = env.skin_cf;
         if (step0 == 0) {
             // staggered launch grid for showcase (spread=0 for GA)
@@ -78,8 +79,7 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
             // Domain-randomized hand throw. Every genome sees the same scenario for
             // a given seed, preserving fair GA ranking; showcase spread adds a small
             // per-plane visual variation without changing the training distribution.
-            int launch_seed = env_seed;
-            ScenarioDesc launch = scenario_desc(launch_seed);
+            ScenarioDesc launch = env;
             float speed = launch.speed, pitch = launch.pitch;
             float yaw = launch.yaw, roll = launch.roll, height = launch.height;
             s_pos = V3(ox, oy, height + oz);
@@ -87,8 +87,24 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
             quat qpitch = qaxis(V3(0, 1, 0), -pitch);
             quat qroll = qaxis(V3(1, 0, 0), roll);
             s_q = qnorm(qmul(qyaw, qmul(qpitch, qroll)));
-            s_vel = qrot(qmul(qyaw, qpitch), V3(speed, 0, 0));
+            // The hand can point the force differently from the held attitude.
+            // This captures noisy launch-angle/force direction independently of
+            // the initial aerodynamic angle of attack.
+            quat qfyaw = qaxis(V3(0, 0, 1), yaw + launch.force_yaw);
+            quat qfpitch = qaxis(V3(0, 1, 0), -(pitch + launch.force_pitch));
+            s_vel = qrot(qmul(qfyaw, qfpitch), V3(speed, 0, 0));
             s_wb = V3(launch.roll_rate, launch.pitch_rate, launch.yaw_rate);
+            // Convert an off-CG hand impulse into angular velocity. A held model
+            // receives constraint reactions from the fingers, so only a calibrated
+            // fraction of the full translational impulse becomes free rotation.
+            v3 grip = V3(launch.grip_x, launch.grip_y, launch.grip_z);
+            v3 Jb = qrot_inv(s_q, scl(s_vel, mp.mass));
+            v3 L = scl(cross(sub(grip, cg_shift), Jb), 0.12f);
+            v3 dwr = V3(mp.invI[0]*L.x + mp.invI[1]*L.y + mp.invI[2]*L.z,
+                         mp.invI[3]*L.x + mp.invI[4]*L.y + mp.invI[5]*L.z,
+                         mp.invI[6]*L.x + mp.invI[7]*L.y + mp.invI[8]*L.z);
+            s_wb = add(s_wb, dwr);
+            float w0 = len(s_wb); if (w0 > 35.0f) s_wb = scl(s_wb, 35.0f / w0);
             s_done = nt <= 0 ? 1.0f : 0.0f; s_t = 0;
             if (nt <= 0) fitness[p] = -100.0f;
         } else {
@@ -117,8 +133,14 @@ __global__ void k_sim(PanelBuf pb, int pop, int seed, float* fitness,
         v3 F = V3(0, 0, 0), Tq = V3(0, 0, 0);
         for (int t = tid; t < nt; t += BLK) {
             float4 c4 = pb.pc[p * MAX_T + t], n4 = pb.pn[p * MAX_T + t];
-            v3 rb = V3(c4.x, c4.y, c4.z); float A = c4.w;
+            v3 rb = sub(V3(c4.x, c4.y, c4.z), cg_shift); float A = c4.w;
             v3 nb = V3(n4.x, n4.y, n4.z);
+            // Low-order print warp: opposing wing sides and fore/aft regions get
+            // smoothly varying normal errors rather than a rigid-body rotation.
+            float ar = env.warp_roll * fmaxf(-1.f, fminf(1.f, rb.y / 0.125f));
+            float ap = env.warp_pitch * fmaxf(-1.f, fminf(1.f, rb.x / 0.125f));
+            v3 nr = V3(nb.x, nb.y - ar*nb.z, nb.z + ar*nb.y);
+            nb = norm3(V3(nr.x + ap*nr.z, nr.y, nr.z - ap*nr.x));
             v3 rw = V3(dot(r0, rb), dot(r1, rb), dot(r2, rb));
             v3 nw = V3(dot(r0, nb), dot(r1, nb), dot(r2, nb));
             v3 vr = sub(add(vel, cross(ww, rw)), wind);
@@ -251,14 +273,17 @@ void evaluate_design(const Genome* g, int scenarios, int base_seed, const char* 
     FILE* f = fopen(csv_path, "w");
     if (!f) { fprintf(stderr, "cannot write %s\n", csv_path); }
     else {
-        fprintf(f, "scenario,seed,distance_m,speed_mps,height_m,pitch_deg,yaw_deg,roll_deg,roll_rate,pitch_rate,yaw_rate,air_density,skin_cf,gust_scale,base_wind_x,base_wind_y\n");
+        fprintf(f, "scenario,seed,distance_m,speed_mps,height_m,pitch_deg,yaw_deg,roll_deg,force_pitch_deg,force_yaw_deg,grip_x_mm,grip_y_mm,grip_z_mm,roll_rate,pitch_rate,yaw_rate,air_density,skin_cf,gust_scale,base_wind_x,base_wind_y,material_scale,infill_ratio,print_bias_x_mm,print_bias_y_mm,print_bias_z_mm,warp_pitch_deg,warp_roll_deg\n");
         for (int i = 0; i < scenarios; i++) {
             int seed = base_seed + i * 7919;
             ScenarioDesc d = scenario_desc(seed);
             const float rad2deg = 57.2957795131f;
-            fprintf(f, "%d,%d,%.6f,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            fprintf(f, "%d,%d,%.6f,%.5f,%.5f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.3f,%.3f,%.3f,%.4f,%.4f\n",
                     i, seed, distances[i], d.speed, d.height, d.pitch*rad2deg, d.yaw*rad2deg, d.roll*rad2deg,
-                    d.roll_rate, d.pitch_rate, d.yaw_rate, d.air_rho, d.skin_cf, d.gust, d.base_x, d.base_y);
+                    d.force_pitch*rad2deg, d.force_yaw*rad2deg, d.grip_x*1000, d.grip_y*1000, d.grip_z*1000,
+                    d.roll_rate, d.pitch_rate, d.yaw_rate, d.air_rho, d.skin_cf, d.gust, d.base_x, d.base_y,
+                    d.material_scale, d.infill_ratio, d.print_bias_x*1000, d.print_bias_y*1000, d.print_bias_z*1000,
+                    d.warp_pitch*rad2deg, d.warp_roll*rad2deg);
         }
         fclose(f);
     }
@@ -325,10 +350,44 @@ static void robust_scores(const std::vector<float>& samples, int pop, int nseeds
         std::sort(row.begin(), row.end());
         float cvar25 = 0;
         for (int s = 0; s < tail_n; s++) cvar25 += row[s] / tail_n;
-        // Tail-aware objective: ordinary performance still matters, but half the
-        // pressure is on ugly releases and the single most hostile case.
-        scores[i] = 0.55f * mean + 0.30f * cvar25 + 0.15f * row[0];
+        // Average distance leads, while 35% of selection pressure still targets
+        // ugly releases through worst-quartile and single-worst performance.
+        scores[i] = 0.65f * mean + 0.25f * cvar25 + 0.10f * row[0];
     }
+}
+
+void select_finalist(const Genome* candidates, int count, int scenarios, int base_seed, const char* out_dir) {
+    if (count < 1 || scenarios < 128) { fprintf(stderr, "select-best needs candidates>=1 and scenarios>=128\n"); return; }
+    std::filesystem::create_directories(out_dir);
+    std::vector<Genome> copies(scenarios);
+    std::vector<float> fit(scenarios), score(1), sorted;
+    Genome* d_gs; float* d_fit;
+    CK(cudaMalloc(&d_gs, sizeof(Genome) * scenarios)); CK(cudaMalloc(&d_fit, sizeof(float) * scenarios));
+    void* pb = panelbuf_alloc(scenarios);
+    char csv_path[512]; snprintf(csv_path, sizeof csv_path, "%s/finalist-selection.csv", out_dir);
+    FILE* csv = fopen(csv_path, "w");
+    fprintf(csv, "candidate,robust_score,mean,cvar25,worst\n");
+    float best_score = -1e9f; int best_i = 0;
+    for (int c = 0; c < count; c++) {
+        std::fill(copies.begin(), copies.end(), candidates[c]);
+        CK(cudaMemcpy(d_gs, copies.data(), sizeof(Genome)*scenarios, cudaMemcpyHostToDevice));
+        gpu_prepare(d_gs, pb, scenarios);
+        gpu_sim(pb, scenarios, base_seed, d_fit, nullptr, 1, 0, 0, 1);
+        CK(cudaMemcpy(fit.data(), d_fit, sizeof(float)*scenarios, cudaMemcpyDeviceToHost));
+        robust_scores(fit, 1, scenarios, score);
+        sorted = fit; std::sort(sorted.begin(), sorted.end());
+        float mean=0, cvar=0; int tail=(scenarios+3)/4;
+        for (float x : sorted) mean += x/scenarios;
+        for (int i=0; i<tail; i++) cvar += sorted[i]/tail;
+        fprintf(csv, "%d,%.6f,%.6f,%.6f,%.6f\n", c, score[0], mean, cvar, sorted[0]);
+        if (score[0] > best_score) { best_score=score[0]; best_i=c; }
+        if (c % 25 == 0 || c == count-1) { printf("finalist %d/%d best %.3fm (candidate %d)\n", c+1,count,best_score,best_i); fflush(stdout); }
+    }
+    fclose(csv);
+    char best_path[512]; snprintf(best_path, sizeof best_path, "%s/best-final.bin", out_dir);
+    FILE* f=fopen(best_path,"wb"); fwrite(&candidates[best_i],sizeof(Genome),1,f); fclose(f);
+    printf("independent finalist winner: candidate %d score %.3fm -> %s\n", best_i,best_score,best_path);
+    panelbuf_free(pb); CK(cudaFree(d_fit)); CK(cudaFree(d_gs));
 }
 
 void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init_path) {
@@ -381,23 +440,27 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init
         for (int i = 0; i < pop; i++) idx[i] = i;
         std::sort(idx.begin(), idx.end(), [&](int a, int b) { return acc[a] > acc[b]; });
         float mean = 0; for (int i = 0; i < pop; i++) mean += acc[i] / pop;
-        // Independent, much larger holdout suite for champion selection. This is
-        // batched as 128 copies of one genome, so it adds little GPU cost while
-        // preventing a lucky eight-scenario specialist from becoming best.bin.
-        std::fill(val_gs.begin(), val_gs.end(), gs[idx[0]]);
-        CK(cudaMemcpy(d_val_gs, val_gs.data(), sizeof(Genome) * VAL_N, cudaMemcpyHostToDevice));
-        gpu_prepare(d_val_gs, val_pb, VAL_N);
-        gpu_sim(val_pb, VAL_N, 100003, d_val_fit, nullptr, 1, 0, 0, 1);
-        CK(cudaMemcpy(val_fit.data(), d_val_fit, sizeof(float) * VAL_N, cudaMemcpyDeviceToHost));
-        robust_scores(val_fit, 1, VAL_N, val_score);
-        float holdout = val_score[0];
+        // Independently validate the top eight training designs. Testing only
+        // rank 1 can miss a genuinely robust aircraft that was rank 2-8 because
+        // of finite training noise; each candidate receives the same holdout.
+        int val_k = std::min(8, pop);
+        float holdout = -1e9f; int champion_i = idx[0];
+        for (int c = 0; c < val_k; c++) {
+            std::fill(val_gs.begin(), val_gs.end(), gs[idx[c]]);
+            CK(cudaMemcpy(d_val_gs, val_gs.data(), sizeof(Genome) * VAL_N, cudaMemcpyHostToDevice));
+            gpu_prepare(d_val_gs, val_pb, VAL_N);
+            gpu_sim(val_pb, VAL_N, 100003, d_val_fit, nullptr, 1, 0, 0, 1);
+            CK(cudaMemcpy(val_fit.data(), d_val_fit, sizeof(float) * VAL_N, cudaMemcpyDeviceToHost));
+            robust_scores(val_fit, 1, VAL_N, val_score);
+            if (val_score[0] > holdout) { holdout = val_score[0]; champion_i = idx[c]; }
+        }
         fprintf(hist, "%d,%.3f,%.3f,%.3f,%.3f\n", gen, acc[idx[0]], holdout, mean, acc[idx[pop / 10]]);
         fflush(hist);
         if (gen % 10 == 0 || gen == gens - 1)
             printf("gen %4d train %7.2fm holdout %7.2fm mean %7.2fm p90 %7.2fm\n",
                    gen, acc[idx[0]], holdout, mean, acc[idx[pop / 10]]);
-        if (holdout > best_ever_f) { best_ever_f = holdout; best_ever = gs[idx[0]]; }
-        archive.push_back(gs[idx[0]]);
+        if (holdout > best_ever_f) { best_ever_f = holdout; best_ever = gs[champion_i]; }
+        archive.push_back(gs[champion_i]);
         if (gen % 25 == 24) { // checkpoint: GPU crash mid-run keeps artifacts
             save_best(out_dir, &best_ever);
             std::vector<Genome> srt(pop);
@@ -446,10 +509,12 @@ void run_ga(int pop, int gens, int nseeds, const char* out_dir, const char* init
     printf("best holdout score: %.2fm (saved %s/best.bin)\n", best_ever_f, out_dir);
     Genome* bg = &best_ever;
     printf("genome: span=%.3f chord=%.3f taper=%.2f sweep=%.2f dih_in=%.2f dih_out=%.2f kink=%.2f\n"
-           "        camber=(%.3f,%.3f) washout=%.3f elev=%.3f nose=%.2f keel=%.3f deck=(%.3f,%.2f) body=%.2f\n",
+           "        camber=(%.3f,%.3f) washout=%.3f elev=%.3f nose=%.2f keel=%.3f deck=(%.3f,%.2f) body=%.2f\n"
+           "        fin=(h %.3f, chord %.2f, sweep %.2f) tail=(span %.2f, chord %.2f, angle %.3f)\n",
            bg->span, bg->chord, bg->taper, bg->sweep, bg->dihedral_in, bg->dihedral_out, bg->kink,
            bg->camber1, bg->camber2, bg->washout, bg->elevator, bg->nose_mass, bg->keel_h,
-           bg->deck_gap, bg->deck_scale, bg->body_frac);
+           bg->deck_gap, bg->deck_scale, bg->body_frac,
+           bg->fin_height, bg->fin_chord, bg->fin_sweep, bg->tail_span, bg->tail_chord, bg->tail_angle);
     panelbuf_free(val_pb); CK(cudaFree(d_val_fit)); CK(cudaFree(d_val_gs));
     panelbuf_free(pb); CK(cudaFree(d_fit)); CK(cudaFree(d_gs));
 }

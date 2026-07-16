@@ -14,9 +14,9 @@
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     fprintf(stderr, "CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
 
-#define RW 1600
-#define RH 900
-#define FPS 60
+#define RW 1280
+#define RH 720
+#define FPS 24
 
 struct Cam { v3 pos, right, up, fwd; float tx, ty; };
 struct RTri { float ax, ay, az, bx, by, bz, cx, cy, cz; uint32_t col; };
@@ -115,6 +115,20 @@ __global__ void k_resolve(const unsigned long long* zb, uint8_t* rgb) {
     if (i >= RW * RH) return;
     uint32_t c = (uint32_t)zb[i];
     rgb[i * 3] = (c >> 16) & 0xff; rgb[i * 3 + 1] = (c >> 8) & 0xff; rgb[i * 3 + 2] = c & 0xff;
+}
+
+__global__ void k_progress(uint8_t* rgb, int frame, int frames) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= RW * RH) return;
+    int x = i % RW, y = i / RW;
+    const int x0 = 28, x1 = RW - 28, y0 = RH - 27, y1 = RH - 15;
+    if (x < x0 || x >= x1 || y < y0 || y >= y1) return;
+    float p = (float)(frame + 1) / frames;
+    int fill = x0 + (int)((x1 - x0) * p);
+    bool tick = ((x - x0) % ((x1 - x0) / 10) < 2);
+    uint8_t r = x <= fill ? 78 : 18, g = x <= fill ? 210 : 24, b = x <= fill ? 255 : 30;
+    if (tick) r = g = b = 235;
+    rgb[i*3] = r; rgb[i*3+1] = g; rgb[i*3+2] = b;
 }
 
 // ---- mesh generation for rendering (COM-centered body frame) ----
@@ -293,16 +307,20 @@ static FILE* open_ffmpeg(const char* path, const char* label) {
     (void)label;
     snprintf(cmd, sizeof cmd,
              "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
-             "-c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium \"%s\"",
+             "-c:v libx264 -pix_fmt yuv420p -crf 22 -preset slow -maxrate 8M -bufsize 16M -movflags +faststart \"%s\"",
              RW, RH, FPS, path);
 #else
     snprintf(cmd, sizeof cmd,
              "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
              "-vf \"drawtext=text='%s':x=28:y=24:fontsize=30:fontcolor=white:box=1:boxcolor=black@0.35:boxborderw=10\" "
-             "-c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium \"%s\"",
+             "-c:v libx264 -pix_fmt yuv420p -crf 22 -preset slow -maxrate 8M -bufsize 16M -movflags +faststart \"%s\"",
              RW, RH, FPS, label, path);
 #endif
+#ifdef _WIN32
     FILE* f = popen(cmd, "wb");
+#else
+    FILE* f = popen(cmd, "w");
+#endif
     if (!f) { fprintf(stderr, "ffmpeg spawn failed\n"); exit(1); }
     return f;
 }
@@ -325,7 +343,7 @@ static Recorded record_flights(const Genome* genomes, int n, int seed, float spr
     CK(cudaMalloc(&R.d_rec, sizeof(float8) * n * R.rec_cap));
     CK(cudaMemset(R.d_rec, 0, sizeof(float8) * n * R.rec_cap));
     float* d_fit; CK(cudaMalloc(&d_fit, sizeof(float) * n));
-    int rec_every = (int)(1.0f / (SIM_DT * FPS) + 0.5f); // 10
+    int rec_every = (int)(1.0f / (SIM_DT * FPS) + 0.5f); // 25 at 24 fps
     gpu_sim(pb, n, seed, d_fit, R.d_rec, rec_every, R.rec_cap, spread, vary_scenarios);
     R.fitness.resize(n);
     CK(cudaMemcpy(R.fitness.data(), d_fit, sizeof(float) * n, cudaMemcpyDeviceToHost));
@@ -427,6 +445,54 @@ void render_robust(const Genome* g, int scenarios, const char* out, int seconds,
     printf("robust video: %d environments, min %.1fm median %.1fm mean %.1fm max %.1fm\n",
            scenarios, f.front(), f[f.size()/2], mean, f.back());
     render_frames(R, seconds * FPS, out, label, 0, 9001);
+}
+
+// Chronological geometry reel. Every archive champion is visited in order and
+// adjacent genomes are interpolated, making the evolving wing/fin/tail planform
+// readable instead of launching all generations as one indistinguishable swarm.
+void render_evolution(const Genome* gs, int n, const char* out, int seconds, const char* label) {
+    if (n < 2 || seconds < 1) { fprintf(stderr, "evolution-video needs >=2 genomes and >=1 second\n"); return; }
+    Genome* d_g; CK(cudaMalloc(&d_g, sizeof(Genome)));
+    v3* d_verts; int* d_tris; int* d_nts; int* d_nvs;
+    CK(cudaMalloc(&d_verts, sizeof(v3) * MAX_V)); CK(cudaMalloc(&d_tris, sizeof(int) * MAX_T * 3));
+    CK(cudaMalloc(&d_nts, sizeof(int))); CK(cudaMalloc(&d_nvs, sizeof(int)));
+    int frames = seconds * FPS;
+    float8* d_rec; CK(cudaMalloc(&d_rec, sizeof(float8) * frames));
+    std::vector<float8> poses(frames);
+    for (int f = 0; f < frames; f++) {
+        float ang = 2.f * 3.14159265358979323846f * 1.35f * f / frames;
+        quat q = qmul(qaxis(V3(0, 0, 1), ang), qaxis(V3(0, 1, 0), -0.12f));
+        float8 r; r.a=0; r.b=0; r.c=0.16f; r.d=q.w; r.e=q.x; r.f=q.y; r.g=q.z; r.h=1; poses[f]=r;
+    }
+    CK(cudaMemcpy(d_rec, poses.data(), sizeof(float8) * frames, cudaMemcpyHostToDevice));
+    RTri* d_rt; CK(cudaMalloc(&d_rt, sizeof(RTri) * MAX_T * 2));
+    unsigned long long* d_zb; CK(cudaMalloc(&d_zb, sizeof(unsigned long long) * RW * RH));
+    uint8_t* d_rgb; CK(cudaMalloc(&d_rgb, RW * RH * 3));
+    uint8_t* h_rgb; CK(cudaHostAlloc(&h_rgb, RW * RH * 3, cudaHostAllocDefault));
+    FILE* ff = open_ffmpeg(out, label);
+    for (int f = 0; f < frames; f++) {
+        float x = (float)f * (n - 1) / fmaxf(1.f, (float)(frames - 1));
+        int a = (int)floorf(x), b = std::min(n - 1, a + 1); float u = x - a;
+        Genome g;
+        for (int j = 0; j < GENOME_N; j++)
+            ((float*)&g)[j] = ((const float*)&gs[a])[j] * (1.f-u) + ((const float*)&gs[b])[j] * u;
+        CK(cudaMemcpy(d_g, &g, sizeof g, cudaMemcpyHostToDevice));
+        k_meshgen<<<1, 64>>>(d_g, 1, d_verts, d_tris, d_nvs, d_nts);
+        Cam cam = make_cam(V3(0.53f, 0.0f, 0.33f), V3(-0.01f, 0, 0.13f), 43);
+        k_clear<<<(RW * RH + 255) / 256, 256>>>(d_zb, cam);
+        k_emit<<<(MAX_T + 127) / 128, 128>>>(d_verts, d_tris, d_nts, d_rec, frames, f, 1, d_rt + MAX_T, 1);
+        k_emit<<<(MAX_T + 127) / 128, 128>>>(d_verts, d_tris, d_nts, d_rec, frames, f, 1, d_rt, 0);
+        k_raster<<<(MAX_T * 2 + 127) / 128, 128>>>(d_rt, MAX_T * 2, d_zb, cam);
+        k_resolve<<<(RW * RH + 255) / 256, 256>>>(d_zb, d_rgb);
+        k_progress<<<(RW * RH + 255) / 256, 256>>>(d_rgb, f, frames);
+        CK(cudaMemcpy(h_rgb, d_rgb, RW * RH * 3, cudaMemcpyDeviceToHost));
+        fwrite(h_rgb, 1, RW * RH * 3, ff);
+        if (f % (FPS * 2) == 0) { printf("evolution frame %d/%d generation %d/%d\n", f, frames, a + 1, n); fflush(stdout); }
+    }
+    pclose(ff);
+    CK(cudaFreeHost(h_rgb)); CK(cudaFree(d_rgb)); CK(cudaFree(d_zb)); CK(cudaFree(d_rt));
+    CK(cudaFree(d_rec)); CK(cudaFree(d_nts)); CK(cudaFree(d_nvs)); CK(cudaFree(d_tris));
+    CK(cudaFree(d_verts)); CK(cudaFree(d_g));
 }
 
 // ---- turntable ----

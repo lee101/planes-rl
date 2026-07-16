@@ -57,7 +57,7 @@ HD static inline quat qaxis(v3 axis, float ang) {
 }
 
 // ---------------- genome ----------------
-#define GENOME_N 16
+#define GENOME_N 35
 struct Genome {
     float span;        // wingspan along surface [m]
     float chord;       // root chord [m]
@@ -75,9 +75,32 @@ struct Genome {
     float deck_gap;    // biplane deck gap [m], <0.02 => monoplane
     float deck_scale;  // upper deck scale
     float body_frac;   // flat center body width fraction
+    float fin_height;  // vertical stabilizer height [m]
+    float fin_chord;   // fin root chord / wing root chord
+    float fin_sweep;   // fin leading-edge rearward sweep / fin root chord
+    float tail_span;   // horizontal tail span / wing span
+    float tail_chord;  // horizontal tail chord / wing root chord
+    float tail_angle;  // horizontal tail incidence [rad]
+    float wing_le_b1;  // cubic Bezier leading-edge control 1 / root chord
+    float wing_le_b2;  // cubic Bezier leading-edge control 2 / root chord
+    float chord_b1;    // cubic chord-distribution control 1
+    float chord_b2;    // cubic chord-distribution control 2
+    float fin_layout;  // center, twin, triple, or outboard symmetric fins
+    float fin_cant;    // paired-fin outward cant [rad]
+    float fin_taper;   // fin tip/root chord ratio
+    float fin_span_pos;// paired-fin position / tail semispan
+    float tail_sweep;  // horizontal-tail rearward sweep / tail chord
+    float tail_taper;  // horizontal-tail tip/root chord ratio
+    float tail_dihedral;// horizontal-tail dihedral [rad]
+    float wing_tip_round; // elliptical-tip blend
+    float center_chord;// root/center chord expansion
 };
-static const float G_LO[GENOME_N] = { 0.12f, 0.05f, 0.25f, 0.00f, -0.30f, -1.20f, 0.45f, -0.04f, -0.06f, -0.20f, -0.20f, 0.0f, 0.005f, 0.000f, 0.50f, 0.06f };
-static const float G_HI[GENOME_N] = { 0.25f, 0.20f, 1.00f, 0.90f,  0.60f,  1.20f, 0.90f,  0.10f,  0.06f,  0.08f,  0.20f, 1.5f, 0.050f, 0.060f, 1.00f, 0.30f };
+static const float G_LO[GENOME_N] = { 0.12f,0.05f,0.04f,0.00f,-0.30f,-1.20f,0.45f,-0.04f,-0.06f,-0.20f,-0.20f,0.0f,0.005f,0.000f,0.50f,0.06f,
+                                      0.004f,0.12f,0.00f,0.12f,0.10f,-0.16f,
+                                     -0.80f,-0.80f,-0.65f,-0.65f,0.00f,0.00f,0.10f,0.15f,-0.40f,0.15f,-0.50f,0.00f,-0.25f };
+static const float G_HI[GENOME_N] = { 0.25f,0.20f,1.00f,0.90f, 0.60f, 1.20f,0.90f, 0.10f, 0.06f, 0.08f, 0.20f,1.5f,0.050f,0.060f,1.00f,0.30f,
+                                      0.065f,0.65f,0.85f,0.65f,0.45f, 0.16f,
+                                      0.80f, 0.80f, 1.00f, 1.00f,1.00f,0.75f,1.00f,1.00f, 1.00f,1.00f, 0.50f,1.00f, 0.80f };
 
 // ---------------- mesh ----------------
 #define CH 5            // chordwise segments
@@ -123,8 +146,23 @@ HD static inline v3 wing_pt(const Genome* g, float u, float xc, float zoff, floa
     float t = fabsf(u) * half;
     float y, z; span_yz(g, t, &y, &z);
     float tf = fabsf(u);
-    float c = g->chord * scale * (1.0f + (g->taper - 1.0f) * tf);
-    float x_le = 0.5f * g->chord * scale - tanf(g->sweep) * t;
+    // Cubic Bezier planform. Mirroring |u| is a hard symmetry heuristic: the
+    // optimizer can invent strongly curved, elliptical, plank, swept, or delta
+    // wings without wasting samples on accidental left/right mismatches.
+    float v = 1.0f - tf;
+    float cr = 1.0f + g->center_chord;
+    float ct = g->taper;
+    float c1 = 1.0f + g->chord_b1, c2 = ct + g->chord_b2;
+    float ratio = v*v*v*cr + 3*v*v*tf*c1 + 3*v*tf*tf*c2 + tf*tf*tf*ct;
+    float ellipse = sqrtf(fmaxf(0.08f, 1.0f - 0.92f*tf*tf));
+    ratio *= 1.0f - g->wing_tip_round + g->wing_tip_round * ellipse;
+    ratio = fmaxf(0.035f, fminf(1.9f, ratio));
+    float c = g->chord * scale * ratio;
+    float xr = 0.5f * g->chord * scale * cr;
+    float xt = 0.5f * g->chord * scale - tanf(g->sweep) * half;
+    float xb1 = xr + g->wing_le_b1 * g->chord * scale;
+    float xb2 = xt + g->wing_le_b2 * g->chord * scale;
+    float x_le = v*v*v*xr + 3*v*v*tf*xb1 + 3*v*tf*tf*xb2 + tf*tf*tf*xt;
     float x = x_le - xc * c;
     float zc = z * scale + camber_z(g, xc) * c;
     float x_c4 = x_le - 0.25f * c;
@@ -153,9 +191,73 @@ HD static inline void emit_wing(const Genome* g, v3* V, int (*T)[3], int* nv, in
         }
 }
 
+// Small, evolvable empennage attached at the root trailing edge.  It gives the
+// search independent yaw and pitch stability controls instead of forcing the
+// swept wing and ventral keel to do every job.
+HD static inline void emit_one_fin(const Genome* g, v3* V, int (*T)[3], int* nv, int* nt,
+                                   float y0, float z0, int side) {
+    float fc = g->chord * g->fin_chord;
+    float sweep = fc * g->fin_sweep;
+    float xr = -0.32f * g->chord - g->tail_chord * g->chord * 0.82f;
+    float tipc = fc * g->fin_taper;
+    float cant = side == 0 ? 0.0f : g->fin_cant;
+    float ya = y0 + side * sinf(cant) * g->fin_height;
+    float za = z0 + cosf(cant) * g->fin_height;
+    int base = *nv;
+    V[(*nv)++] = V3(xr + 0.5f*fc, y0, z0);
+    V[(*nv)++] = V3(xr - 0.5f*fc, y0, z0);
+    V[(*nv)++] = V3(xr - sweep + 0.5f*tipc, ya, za);
+    V[(*nv)++] = V3(xr - sweep - 0.5f*tipc, ya, za);
+    T[*nt][0]=base; T[*nt][1]=base+1; T[*nt][2]=base+2; (*nt)++;
+    T[*nt][0]=base+1; T[*nt][1]=base+3; T[*nt][2]=base+2; (*nt)++;
+}
+
+HD static inline void emit_tail(const Genome* g, v3* V, int (*T)[3], int* nv, int* nt) {
+    float hs = 0.5f * g->span * g->tail_span;
+    float hc = g->chord * g->tail_chord;
+    float x0 = -0.32f * g->chord;
+    float z0 = camber_z(g, 0.82f) * g->chord;
+    int base = *nv;
+    for (int i = 0; i < 3; i++) {
+        float u = (float)(i - 1), au = fabsf(u);
+        float tc = hc * (1.0f + (g->tail_taper - 1.0f) * au);
+        float xle = x0 - g->tail_sweep * hc * au;
+        for (int j = 0; j < 3; j++) {
+            float xc = 0.5f * j;
+            float x = xle - xc * tc;
+            float z = z0 + g->tail_angle * (x - xle) + au * hs * sinf(g->tail_dihedral);
+            V[(*nv)++] = V3(x, u * hs * cosf(g->tail_dihedral), z);
+        }
+    }
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+        int a = base + i * 3 + j, b = a + 3;
+        T[*nt][0] = a; T[*nt][1] = b; T[*nt][2] = a + 1; (*nt)++;
+        T[*nt][0] = b; T[*nt][1] = b + 1; T[*nt][2] = a + 1; (*nt)++;
+    }
+
+    float yp = hs * g->fin_span_pos * cosf(g->tail_dihedral);
+    float zp = z0 + hs * g->fin_span_pos * sinf(g->tail_dihedral);
+    if (g->fin_layout < 0.25f) {
+        emit_one_fin(g,V,T,nv,nt,0,z0,0);                 // classic center fin
+    } else if (g->fin_layout < 0.50f) {
+        emit_one_fin(g,V,T,nv,nt,-yp,zp,-1);             // symmetric twin fins
+        emit_one_fin(g,V,T,nv,nt, yp,zp, 1);
+    } else if (g->fin_layout < 0.75f) {
+        emit_one_fin(g,V,T,nv,nt,0,z0,0);                // symmetric triple fin
+        emit_one_fin(g,V,T,nv,nt,-yp,zp,-1);
+        emit_one_fin(g,V,T,nv,nt, yp,zp, 1);
+    } else {
+        float yo = hs * 0.94f * cosf(g->tail_dihedral);  // outboard endplate fins
+        float zo = z0 + hs * 0.94f * sinf(g->tail_dihedral);
+        emit_one_fin(g,V,T,nv,nt,-yo,zo,-1);
+        emit_one_fin(g,V,T,nv,nt, yo,zo, 1);
+    }
+}
+
 HD static inline void build_mesh(const Genome* g, v3* V, int (*T)[3], MeshOut* mo) {
     int nv = 0, nt = 0;
     emit_wing(g, V, T, &nv, &nt, 0, 1.0f);
+    emit_tail(g, V, T, &nv, &nt);
     int decks = g->deck_gap > 0.02f ? 2 : 1;
     if (decks == 2) emit_wing(g, V, T, &nv, &nt, g->deck_gap, g->deck_scale);
     // keel: vertical sheet under centerline
@@ -276,6 +378,12 @@ struct ScenarioDesc {
     float speed, pitch, yaw, roll, height;
     float roll_rate, pitch_rate, yaw_rate;
     float air_rho, skin_cf, gust, base_x, base_y;
+    float force_pitch, force_yaw; // impulse direction relative to held attitude
+    float grip_x, grip_y, grip_z; // hand-force point relative to nominal CG [m]
+    float material_scale;         // density x extrusion/flow variation
+    float infill_ratio;           // added internal/rib mass / shell mass
+    float print_bias_x, print_bias_y, print_bias_z; // asymmetric infill/adhesion
+    float warp_pitch, warp_roll;  // small print-induced surface normal errors
 };
 
 HD static inline ScenarioDesc scenario_desc(int seed) {
@@ -294,7 +402,58 @@ HD static inline ScenarioDesc scenario_desc(int seed) {
     float phase = (float)(seed * 37 % 97);
     d.base_x = -0.25f + 1.15f * sinf(phase * 0.71f);
     d.base_y = 1.00f * sinf(phase * 1.13f);
+    d.force_pitch = 0.075f * scenario_signed(seed, 10);
+    d.force_yaw = 0.060f * scenario_signed(seed, 11);
+    d.grip_x = 0.018f * scenario_signed(seed, 12);
+    d.grip_y = 0.022f * scenario_signed(seed, 13);
+    d.grip_z = 0.010f * scenario_signed(seed, 14);
+    // PLA brand, moisture, flow calibration, wall width and sparse infill/ribs.
+    d.material_scale = 0.88f + 0.24f * scenario_u01(seed, 15);
+    d.infill_ratio = 0.06f + 0.34f * scenario_u01(seed, 16);
+    d.print_bias_x = 0.018f * scenario_signed(seed, 17);
+    d.print_bias_y = 0.010f * scenario_signed(seed, 18);
+    d.print_bias_z = 0.006f * scenario_signed(seed, 19);
+    // Higher/lower layer ridging is represented jointly by drag and mild warp.
+    d.skin_cf *= 0.90f + 0.25f * scenario_u01(seed, 20);
+    d.warp_pitch = 0.025f * scenario_signed(seed, 21);
+    d.warp_roll = 0.035f * scenario_signed(seed, 22);
     return d;
+}
+
+HD static inline void point_inertia(float I[6], v3 r, float m) {
+    I[0] += m * (r.y*r.y + r.z*r.z); I[1] += m * (r.x*r.x + r.z*r.z);
+    I[2] += m * (r.x*r.x + r.y*r.y); I[3] -= m * r.x*r.y;
+    I[4] -= m * r.x*r.z; I[5] -= m * r.y*r.z;
+}
+
+HD static inline void invert_inertia(MassProps* mp) {
+    float xx=mp->I[0], yy=mp->I[1], zz=mp->I[2], xy=mp->I[3], xz=mp->I[4], yz=mp->I[5];
+    float det = xx*(yy*zz-yz*yz) - xy*(xy*zz-yz*xz) + xz*(xy*yz-yy*xz);
+    float id = 1.0f / fmaxf(det, 1e-24f);
+    mp->invI[0]=(yy*zz-yz*yz)*id; mp->invI[1]=(xz*yz-xy*zz)*id; mp->invI[2]=(xy*yz-xz*yy)*id;
+    mp->invI[3]=mp->invI[1]; mp->invI[4]=(xx*zz-xz*xz)*id; mp->invI[5]=(xy*xz-xx*yz)*id;
+    mp->invI[6]=mp->invI[2]; mp->invI[7]=mp->invI[5]; mp->invI[8]=(xx*yy-xy*xy)*id;
+}
+
+// Convert slicer/process uncertainty into effective mass, CG and inertia.  The
+// infill term follows the shell distribution but may be biased by imperfect
+// adhesion, seams and nonuniform internal ribs.
+HD static inline MassProps printed_mass_props(MassProps src, ScenarioDesc d, v3* cg_shift) {
+    float m_shell = src.mass * d.material_scale;
+    float m_fill = m_shell * d.infill_ratio;
+    float m = m_shell + m_fill;
+    v3 bias = V3(d.print_bias_x, d.print_bias_y, d.print_bias_z);
+    *cg_shift = scl(bias, m_fill / m);
+    float scale = m / src.mass;
+    for (int k = 0; k < 6; k++) src.I[k] *= scale;
+    // Parallel-axis correction for two distributed components whose centroids
+    // are separated by the randomized print bias.
+    point_inertia(src.I, scl(*cg_shift, -1.0f), m_shell);
+    point_inertia(src.I, sub(bias, *cg_shift), m_fill);
+    src.mass = m; src.invmass = 1.0f / m;
+    src.com = add(src.com, *cg_shift);
+    invert_inertia(&src);
+    return src;
 }
 
 HD static inline v3 wind_at(v3 p, float t, int seed) {

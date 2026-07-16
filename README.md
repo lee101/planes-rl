@@ -9,20 +9,23 @@ The optimizer is a genetic algorithm (rather than a policy-learning RL agent), b
 - Maximum build envelope: **250 x 250 x 250 mm**.
 - Material: ordinary PLA at **1240 kg/m3**.
 - Optimization wall: **0.45 mm** single-wall shell (`PLA_WALL_M`).
-- Typical included designs: roughly 15-22 g including parameterized nose ballast.
-- Hand launch domain: 7.2-11.2 m/s, varied release pitch/yaw/roll and height, release angular rates, calm-to-severe gust fields, head/tailwind, crosswind, air density, and skin drag.
-- Tail-aware objective: 55% mean distance, 30% worst-quartile CVaR, and 15% single worst case. Oversize designs receive a hard negative fitness.
-- Champion selection uses an independent 128-scenario GPU holdout suite every generation, preventing lucky training specialists from becoming `best.bin`.
+- Typical included designs: roughly 16-25 g including parameterized nose ballast and empennage.
+- Hand launch domain: 7.2-11.2 m/s, varied held attitude, independent force-direction error, release height/rates, off-CG grip impulse, calm-to-severe gust fields, head/tailwind, crosswind, and air density.
+- Print domain: PLA density/extrusion scale, 6-40% equivalent infill/rib mass, asymmetric infill/adhesion CG bias, layer-dependent skin drag, and mild pitch/roll warping.
+- Tail-aware objective: 65% mean distance, 25% worst-quartile CVaR, and 10% single worst case. Oversize designs receive a hard negative fitness.
+- Champion selection tests each generation's top eight candidates on an independent 128-scenario GPU holdout suite, preventing lucky training specialists from becoming `best.bin`.
 
 ## Geometry
 
-A 16-float genome controls span, chord, taper, sweep, inner/outer dihedral, winglet kink, cubic camber, washout, trailing-edge reflex, nose ballast, keel, center-body width, and an optional second wing deck. Meshes contain about 166 triangles for a monoplane or 330 for a biplane before STL shell thickening.
+A 35-float genome controls the original wing, camber, ballast, keel, and optional biplane parameters plus cubic-Bezier leading-edge and chord distributions, elliptical tip blending, center-chord expansion, swept/tapered/dihedral horizontal tails, and center/twin/triple/outboard fin topology with cant, taper, and span position. Every planform and paired fin is mirrored exactly about the center plane as a structural symmetry heuristic. The expanded search can express curved, elliptical, plank, swept, and strongly triangular/delta families without introducing accidental left/right imbalance.
 
 `mass_props()` treats every aerodynamic triangle as a uniform extruded PLA lamina. It integrates triangle second moments, includes through-thickness inertia, adds the nose ballast, then computes center of mass and the full inverse inertia tensor. STL mass reporting scales with the requested export thickness.
 
 ## Robust GPU flight simulation
 
-Each CUDA block owns one plane. Threads stride its panels, calculate local relative flow including rotational velocity, reduce force/torque with warp shuffles, and integrate a 6DOF rigid body at 600 Hz. Kernels run in one-second chunks to avoid long uninterruptible launches.
+Each CUDA block owns one plane. Threads stride its panels, calculate local relative flow including rotational velocity and print warp, reduce force/torque with warp shuffles, and integrate a 6DOF rigid body at 600 Hz. Kernels run in one-second chunks to avoid long uninterruptible launches.
+
+The release is impulse-based. Aircraft attitude and force direction are randomized separately, and the impulse is applied at a randomized grip point. Its moment about the print-adjusted CG is converted through the full inertia tensor into release rotation. Print variation changes mass, CG, inertia, drag, and local surface normals for each scenario.
 
 For each evaluation seed, every candidate receives the same deterministic imperfect throw, preserving fair rankings. Across seeds the optimizer sees different:
 
@@ -35,7 +38,7 @@ Use at least 8 seeds for serious robust optimization.
 
 ## GPU renderer
 
-The renderer is CUDA-only: procedural sky/ground, shadows, flight ribbons, wind particles, and a packed 64-bit atomic depth/color buffer streamed to `ffmpeg`. Swarm rendering uses exact per-plane triangle prefix ranges instead of rasterizing `MAX_T` empty slots for every aircraft, and frame readback uses pinned host memory.
+The renderer is CUDA-only: procedural sky/ground, shadows, flight ribbons, wind particles, and a packed 64-bit atomic depth/color buffer streamed to `ffmpeg`. Swarm rendering uses exact per-plane triangle prefix ranges instead of rasterizing `MAX_T` empty slots for every aircraft, and frame readback uses pinned host memory. Video output is 1280x720 at 24 fps, H.264/yuv420p, fast-start MP4, with an 8 Mbps ceiling. `evolution-video` interpolates archive champions in chronological order so geometry changes remain readable.
 
 ## Build
 
@@ -74,6 +77,33 @@ Run the full search:
 ```bash
 ./planes evolve --pop 8192 --gens 3000 --seeds 8 --out out \
   --init out/presets/seeds.bin
+```
+
+Reproduce the realistic 300-generation, 10,000-aircraft run and its artifacts:
+
+```bash
+make realistic-run
+# out/realistic-run/best-plane.stl
+# out/realistic-run/evolution-300x10000.mp4
+# out/realistic-run/robustness-10000.csv
+```
+
+Run the larger 100-generation search with 100,000 aircraft per generation and
+produce a chronological, social-media-ready evolution reel:
+
+```bash
+make realistic-run2
+# out/realistic-run2/best-plane.stl
+# out/realistic-run2/evolution-100x100000-twitter.mp4
+```
+
+Run the high-diversity Bezier/multi-fin search without spending GPU time on video:
+
+```bash
+make shape-robust-run
+# 300 generations x 100,000 geometries x 12 training environments
+# out/shape-robust-run/best-final-plane.stl
+# out/shape-robust-run/final-robustness-100000.csv
 ```
 
 Audit the champion across thousands of independent environments, then inspect and export it:
@@ -115,7 +145,7 @@ See `REFERENCE_MODELS.md` for downloadable community gliders worth comparing aga
 
 ## Important physical limitations
 
-This is a fast panel model, not CFD or a slicer. It does not yet model layer-line anisotropy, impact breakage, nozzle corner rounding, support scars, infill, or aeroelastic wing bending. Validate finalists with a slicer and real throws, then feed measured mass/CG and launch data back into the constants or future calibration tooling.
+This is a fast panel model, not CFD or a slicer. Infill is an equivalent distributed-mass model with randomized imbalance; the STL itself does not encode a slicer's infill path. The simulator does not yet resolve layer-line strength/impact breakage, nozzle corner rounding, support scars, detailed internal toolpaths, or aeroelastic wing bending. Validate finalists with a slicer and real throws, then calibrate the modeled distributions using measured mass, CG, release, and wind data.
 
 ## Windows toolchain
 

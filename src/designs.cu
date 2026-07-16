@@ -10,19 +10,35 @@ struct NamedDesign { const char* name; Genome g; };
 static Genome design(float span, float chord, float taper, float sweep,
                      float di, float dout, float kink, float c1, float c2,
                      float washout, float elevator, float nose, float keel,
-                     float gap, float deck_scale, float body) {
+                     float gap, float deck_scale, float body,
+                     float fin_h, float fin_chord, float fin_sweep,
+                     float tail_span, float tail_chord, float tail_angle, float style) {
     Genome g = { span, chord, taper, sweep, di, dout, kink, c1, c2,
-                 washout, elevator, nose, keel, gap, deck_scale, body };
+                 washout, elevator, nose, keel, gap, deck_scale, body,
+                 fin_h, fin_chord, fin_sweep, tail_span, tail_chord, tail_angle };
+    g.wing_le_b1 = -0.45f + 0.75f*style;
+    g.wing_le_b2 =  0.35f - 0.65f*style;
+    g.chord_b1 = 0.30f - 0.45f*style;
+    g.chord_b2 = -0.15f + 0.55f*style;
+    g.fin_layout = style;
+    g.fin_cant = 0.12f + 0.45f*style;
+    g.fin_taper = 0.30f + 0.55f*(1.0f-style);
+    g.fin_span_pos = 0.35f + 0.55f*style;
+    g.tail_sweep = -0.10f + 0.75f*style;
+    g.tail_taper = 0.95f - 0.55f*style;
+    g.tail_dihedral = -0.12f + 0.30f*style;
+    g.wing_tip_round = 0.15f + 0.75f*style;
+    g.center_chord = -0.10f + 0.55f*(1.0f-style);
     return g;
 }
 
 static std::vector<NamedDesign> preset_designs() {
     return {
-        { "stable_gull", design(.235f,.105f,.58f,.24f, .13f,.58f,.72f,.025f,.010f, -.055f,.035f,.42f,.027f,0,.8f,.12f) },
-        { "fast_dart", design(.205f,.145f,.28f,.52f, .06f,.30f,.78f,.012f,-.005f, -.035f,.025f,.72f,.023f,0,.75f,.10f) },
-        { "efficient_plank", design(.245f,.082f,.82f,.12f, .10f,.42f,.68f,.030f,.004f, -.070f,.060f,.30f,.032f,0,.9f,.16f) },
-        { "boxy_biplane", design(.205f,.090f,.70f,.16f, .08f,.32f,.70f,.022f,.005f, -.040f,.035f,.38f,.024f,.034f,.82f,.14f) },
-        { "compact_trainer", design(.185f,.100f,.68f,.20f, .18f,.72f,.62f,.035f,.012f, -.065f,.050f,.48f,.036f,0,.8f,.18f) }
+        { "stable_gull", design(.235f,.105f,.58f,.24f, .13f,.58f,.72f,.025f,.010f, -.055f,.035f,.42f,.027f,0,.8f,.12f, .038f,.35f,.30f,.36f,.22f,-.025f,.10f) },
+        { "fast_dart", design(.205f,.145f,.16f,.52f, .06f,.30f,.78f,.012f,-.005f, -.035f,.025f,.72f,.023f,0,.75f,.10f, .022f,.22f,.60f,.18f,.14f,.015f,.30f) },
+        { "efficient_plank", design(.245f,.082f,.82f,.12f, .10f,.42f,.68f,.030f,.004f, -.070f,.060f,.30f,.032f,0,.9f,.16f, .030f,.42f,.18f,.48f,.18f,-.045f,.55f) },
+        { "boxy_biplane", design(.205f,.090f,.70f,.16f, .08f,.32f,.70f,.022f,.005f, -.040f,.035f,.38f,.024f,.034f,.82f,.14f, .045f,.48f,.22f,.42f,.28f,-.020f,.72f) },
+        { "compact_trainer", design(.185f,.100f,.68f,.20f, .18f,.72f,.62f,.035f,.012f, -.065f,.050f,.48f,.036f,0,.8f,.18f, .050f,.55f,.12f,.58f,.32f,-.060f,.92f) }
     };
 }
 

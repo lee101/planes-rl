@@ -7,3 +7,4 @@ out/**/*.bin
 out/**/*.stl
 out/**/*.csv
 out/**/*.log
+*.mp4

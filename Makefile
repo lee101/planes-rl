@@ -33,10 +33,27 @@ robust-video: planes$(EXE)
 stl: planes$(EXE)
 	./planes$(EXE) stl --best out/best.bin --o out/plane.stl --th 0.45
 
+realistic-run: planes$(EXE) presets
+	$(LOCK) ./planes$(EXE) evolve --pop 10000 --gens 300 --seeds 8 --out out/realistic-run --init out/presets/seeds.bin
+	$(LOCK) ./planes$(EXE) evaluate --best out/realistic-run/best.bin --n 10000 --seed 730001 --o out/realistic-run/robustness-10000.csv
+	./planes$(EXE) stl --best out/realistic-run/best.bin --o out/realistic-run/best-plane.stl --th 0.45
+	$(LOCK) ./planes$(EXE) showcase --pop-file out/realistic-run/archive.bin --n 300 --sec 12 --o out/realistic-run/evolution-300x10000.mp4 --label "300 generations x 10000 PLA gliders - print and launch robust"
+
+realistic-run2: planes$(EXE)
+	$(LOCK) ./planes$(EXE) evolve --pop 100000 --gens 100 --seeds 8 --out out/realistic-run2 --init out/realistic-run/pop.bin
+	$(LOCK) ./planes$(EXE) evaluate --best out/realistic-run2/best.bin --n 10000 --seed 930001 --o out/realistic-run2/robustness-10000.csv
+	./planes$(EXE) stl --best out/realistic-run2/best.bin --o out/realistic-run2/best-plane.stl --th 0.45
+	$(LOCK) ./planes$(EXE) evolution-video --pop-file out/realistic-run2/archive.bin --n 100 --sec 20 --o out/realistic-run2/evolution-100x100000-twitter.mp4 --label "100 chronological generations x 100000 PLA gliders"
+
+shape-robust-run: planes$(EXE) presets
+	$(LOCK) ./planes$(EXE) evolve --pop 100000 --gens 300 --seeds 12 --out out/shape-robust-run --init out/presets/seeds.bin
+	$(LOCK) ./planes$(EXE) evaluate --best out/shape-robust-run/best.bin --n 100000 --seed 2930001 --o out/shape-robust-run/final-robustness-100000.csv
+	./planes$(EXE) stl --best out/shape-robust-run/best.bin --o out/shape-robust-run/best-final-plane.stl --th 0.45
+
 clean:
 	rm -f planes planes.exe
 
-.PHONY: clean evolve evaluate videos robust-video stl presets host-test
+.PHONY: clean evolve evaluate videos robust-video stl presets host-test realistic-run realistic-run2 shape-robust-run
 
 
 presets: planes$(EXE)
